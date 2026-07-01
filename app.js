@@ -70,6 +70,7 @@
   };
   const DEMO_AVATAR03_SOURCE_KIND = "asset-demo-avatar03";
   const DEFAULT_SETTINGS_URL = "assets/demo-avatar/default-settings.json";
+  const DEMO_AVATAR02_SETTINGS_URL = "assets/demo-avatar02/default-settings.json";
   const DEMO_AVATAR03_SETTINGS_URL = "assets/demo-avatar03/default-settings.json";
   const AVATAR_PACKAGE_ASSETS = {
     backHair: "avatar/back-hair.png",
@@ -3190,6 +3191,7 @@
     const templatePayload = settingsUrl
       ? await loadSettingsPayloadFromUrl(settingsUrl)
       : buildAllSettingsPayload({ includeItemImages: false, includeBaseline: true });
+    const defaultSettingsSignature = settingsUrl ? settingsPayloadSignature(templatePayload) : null;
     const templateSize = settingsUrl
       ? (templatePayload.avatarImageSize || { width: size.w, height: size.h })
       : fromSize;
@@ -3226,6 +3228,7 @@
         assetMap: { ...(assetMap || {}) },
         settingsUrl,
         assetSignature,
+        ...(defaultSettingsSignature ? { defaultSettingsSignature } : {}),
         thumbnailVersion: AVATAR_ASSET_THUMBNAIL_VERSION,
       },
       lastError: null,
@@ -3302,9 +3305,15 @@
     if (record?.source?.settingsUrl) return String(record.source.settingsUrl);
     switch (record?.source?.kind) {
       case "default": return DEFAULT_SETTINGS_URL;
+      case DEMO_AVATAR02_SOURCE_KIND: return DEMO_AVATAR02_SETTINGS_URL;
       case DEMO_AVATAR03_SOURCE_KIND: return DEMO_AVATAR03_SETTINGS_URL;
       default: return null;
     }
+  }
+
+  function settingsPayloadSignature(payload) {
+    const text = JSON.stringify(payload || {});
+    return `${text.length}:${crc32(textToU8(text)).toString(16)}`;
   }
 
   async function avatarImageBlobsFromLoadedImages(loadedImages) {
@@ -3411,6 +3420,27 @@
     };
   }
 
+  async function refreshDefaultCharacterProfileSettings(record, avatarSize) {
+    const settingsUrl = settingsUrlForCharacterProfile(record);
+    if (!settingsUrl) return null;
+    const defaultPayload = await loadSettingsPayloadFromUrl(settingsUrl);
+    const defaultSettingsSignature = settingsPayloadSignature(defaultPayload);
+    if (record.source?.defaultSettingsSignature === defaultSettingsSignature) {
+      return { changed: false, defaultSettingsSignature };
+    }
+
+    const templateSize = defaultPayload.avatarImageSize || { width: avatarSize.w, height: avatarSize.h };
+    let settingsPayload = scaleSettingsPayloadForAvatarSize(defaultPayload, templateSize, avatarSize);
+    const itemImageBlobs = collectItemImageBlobsFromSettingsPayload(settingsPayload);
+    settingsPayload = stripItemLayerSourcesFromSettingsPayload(settingsPayload);
+    return {
+      changed: true,
+      defaultSettingsSignature,
+      settingsPayload,
+      itemImageBlobs,
+    };
+  }
+
   async function refreshAssetBackedCharacterProfileAssets(record, { persist = true } = {}) {
     const assetMap = assetMapForCharacterProfile(record);
     if (!record || !assetMap) return record;
@@ -3422,26 +3452,26 @@
       Number(savedSize?.width || savedSize?.w) === size.w &&
       Number(savedSize?.height || savedSize?.h) === size.h;
     const thumbnailMatches = record.source?.thumbnailVersion === AVATAR_ASSET_THUMBNAIL_VERSION;
-    const defaultItemRefresh = await refreshDefaultCharacterProfileItems(record);
+    const settingsUrl = settingsUrlForCharacterProfile(record);
+    const defaultSettingsRefresh = await refreshDefaultCharacterProfileSettings(record, size);
     if (
       record.source?.assetSignature === assetSignature &&
       sizeMatches &&
       thumbnailMatches &&
-      !defaultItemRefresh?.changed
+      !defaultSettingsRefresh?.changed
     ) {
       return record;
     }
 
     const now = new Date().toISOString();
     const thumbnailDataUrl = await buildAvatarCompositeThumbnailDataUrl(loadedImages);
-    const settingsUrl = settingsUrlForCharacterProfile(record);
     const refreshed = {
       ...record,
       updatedAt: now,
       avatarImageSize: { width: size.w, height: size.h },
-      settingsPayload: defaultItemRefresh?.settingsPayload || scaleSettingsPayloadForAvatarSize(record.settingsPayload || {}, savedSize, size),
+      settingsPayload: defaultSettingsRefresh?.settingsPayload || scaleSettingsPayloadForAvatarSize(record.settingsPayload || {}, savedSize, size),
       avatarImageBlobs,
-      itemImageBlobs: defaultItemRefresh?.itemImageBlobs || record.itemImageBlobs || {},
+      itemImageBlobs: defaultSettingsRefresh?.itemImageBlobs || record.itemImageBlobs || {},
       thumbnailDataUrl,
       cachedPackageBlob: null,
       cachedPackageUpdatedAt: null,
@@ -3453,7 +3483,9 @@
         ...(settingsUrl ? { settingsUrl } : {}),
         assetSignature,
         thumbnailVersion: AVATAR_ASSET_THUMBNAIL_VERSION,
-        ...(defaultItemRefresh ? { defaultItemsSignature: defaultItemRefresh.managedSignature } : {}),
+        ...(defaultSettingsRefresh?.defaultSettingsSignature
+          ? { defaultSettingsSignature: defaultSettingsRefresh.defaultSettingsSignature }
+          : {}),
       },
       lastError: null,
     };
@@ -3723,6 +3755,7 @@
       assetMap: DEMO_AVATAR02_ASSETS,
       name: "キャラ2",
       sourceKind: DEMO_AVATAR02_SOURCE_KIND,
+      settingsUrl: DEMO_AVATAR02_SETTINGS_URL,
       replaceId: target?.id || null,
       createdAt: target?.createdAt || null,
     });

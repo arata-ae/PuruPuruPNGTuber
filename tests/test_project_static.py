@@ -218,24 +218,26 @@ class ProjectStaticTests(unittest.TestCase):
         settings = json.loads((DEMO_AVATAR_DIR / "default-settings.json").read_text(encoding="utf-8"))
         state = settings["state"]
         expected_state = {
-            "rangeLeft": 60,
-            "rangeRight": 60,
+            "rangeLeft": 35,
+            "rangeRight": 35,
             "rangeUp": 10,
             "rangeDown": 25,
             "angleXDeform": 60,
             "faceTurnDepth": 200,
             "faceTurnVertical": 150,
-            "avatarSize": 78,
-            "avatarX": -155,
-            "avatarY": 4,
+            "avatarSize": 87,
+            "avatarX": -163,
+            "avatarY": -80,
             "hairWarp": 120,
             "frontHairShadowStrength": 60,
             "bgColor": "#FFF8EE",
         }
         for key, value in expected_state.items():
             self.assertEqual(state.get(key), value, key)
+        self.assertEqual(settings["avatarImageSize"], {"width": 1024, "height": 1536})
         self.assertEqual(settings["outputSettings"]["obsPreset"], "standard")
-        self.assertEqual(settings["activeItemLayerId"], 1)
+        self.assertIn("deformers", settings)
+        self.assertEqual(settings["activeItemLayerId"], 2)
         self.assertEqual(len(settings["itemLayers"]), 2)
         body_item = settings["itemLayers"][0]
         self.assertEqual(body_item["file"], "items/body.png")
@@ -252,11 +254,39 @@ class ProjectStaticTests(unittest.TestCase):
         self.assertEqual(hairpin_item["followStrength"], 75)
         self.assertTrue(hairpin_item["locked"])
 
+    def test_demo_avatar02_settings_match_public_demo_avatar(self) -> None:
+        settings = json.loads((ROOT / "assets" / "demo-avatar02" / "default-settings.json").read_text(encoding="utf-8"))
+        state = settings["state"]
+        expected_state = {
+            "rangeLeft": 60,
+            "rangeRight": 60,
+            "rangeUp": 30,
+            "rangeDown": 30,
+            "angleXDeform": 15,
+            "faceTurnDepth": 10,
+            "faceTurnVertical": 119,
+            "avatarSize": 65,
+            "avatarX": -169,
+            "avatarY": -33,
+            "hairWarp": 80,
+            "frontHairShadowStrength": 60,
+            "bgColor": "#FFF8EE",
+        }
+        for key, value in expected_state.items():
+            self.assertEqual(state.get(key), value, key)
+        self.assertEqual(settings["avatarImageSize"], {"width": 900, "height": 900})
+        self.assertEqual(settings["outputSettings"]["obsPreset"], "standard")
+        self.assertIn("deformers", settings)
+        self.assertIsNone(settings["activeItemLayerId"])
+        self.assertEqual(settings["itemLayers"], [])
+
     def test_demo_avatar03_settings_include_three_locked_items(self) -> None:
         settings = json.loads((ROOT / "assets" / "demo-avatar03" / "default-settings.json").read_text(encoding="utf-8"))
         self.assertEqual(settings["avatarImageSize"], {"width": 1024, "height": 1024})
-        self.assertEqual(settings["state"]["avatarSize"], 78)
-        self.assertEqual(settings["state"]["avatarX"], -155)
+        self.assertIn("deformers", settings)
+        self.assertEqual(settings["state"]["avatarSize"], 90)
+        self.assertEqual(settings["state"]["avatarX"], -158)
+        self.assertEqual(settings["state"]["avatarY"], 111)
         self.assertEqual(settings["activeItemLayerId"], 1)
         self.assertEqual(len(settings["itemLayers"]), 3)
         expected = [
@@ -277,9 +307,12 @@ class ProjectStaticTests(unittest.TestCase):
         readme = self.read_text("README.md")
         usage = self.read_text("docs/usage.md")
         self.assertIn("assets/demo-avatar/back-hair.png", app)
+        self.assertIn("assets/demo-avatar02/back-hair.png", app)
         self.assertIn("assets/demo-avatar03/back-hair.png", app)
         self.assertIn('const DEFAULT_SETTINGS_URL = "assets/demo-avatar/default-settings.json"', app)
+        self.assertIn('const DEMO_AVATAR02_SETTINGS_URL = "assets/demo-avatar02/default-settings.json"', app)
         self.assertIn("assets/demo-avatar/", readme)
+        self.assertIn("assets/demo-avatar02/", readme)
         self.assertIn("assets/demo-avatar03/", readme)
         self.assertIn("使い方 / Usage", usage)
         self.assertIn("Codex / Claude Code", usage)
@@ -687,6 +720,9 @@ class ProjectStaticTests(unittest.TestCase):
             "assetSignature",
             "thumbnailVersion",
             "defaultItemsSignature",
+            "defaultSettingsSignature",
+            "function settingsPayloadSignature(",
+            "async function refreshDefaultCharacterProfileSettings(",
             "async function switchCharacterProfile(",
             "async function flushActiveCharacterAutosave(",
             "async function duplicateActiveCharacterProfile(",
