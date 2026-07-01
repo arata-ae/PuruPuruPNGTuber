@@ -1,0 +1,725 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="ぷるぷる動くPNGアバターをブラウザだけで操作・OBS表示できるPNGTuberアプリです。" />
+  <meta name="theme-color" content="#0f1020" />
+  <meta name="color-scheme" content="light" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net 'wasm-unsafe-eval'; connect-src 'self' https://cdn.jsdelivr.net https://storage.googleapis.com; worker-src 'self' blob:; img-src 'self' data: blob:; style-src 'self'; object-src 'none'; base-uri 'none'"
+  />
+  <title>ぷるぷるPNGTuber</title>
+  <link rel="icon" href="./favicon.ico" sizes="32x32" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <canvas id="stage" aria-label="アバタープレビュー"></canvas>
+  <div id="characterSwitcher" class="character-switcher" aria-label="キャラ切り替え">
+    <button
+      id="characterSwitcherButton"
+      class="character-switcher-button"
+      type="button"
+      aria-haspopup="menu"
+      aria-expanded="false"
+      aria-controls="characterSwitcherMenu"
+    >
+      <img id="activeCharacterThumb" class="character-switcher-thumb" alt="" />
+      <span class="character-switcher-text">
+        <span id="activeCharacterName">キャラ1</span>
+        <span id="activeCharacterSaveStatus">準備中</span>
+      </span>
+      <span class="character-switcher-caret" aria-hidden="true">▼</span>
+    </button>
+
+    <div id="characterSwitcherMenu" class="character-switcher-menu" role="menu" hidden>
+      <div id="characterList" class="character-list"></div>
+      <div class="character-menu-actions">
+        <button id="addCharacterButton" class="ghost-button" type="button">＋ ファイルから追加</button>
+        <button id="duplicateCharacterButton" class="ghost-button muted-button" type="button">現在のキャラを複製</button>
+      </div>
+    </div>
+    <input id="addCharacterFileInput" type="file" accept=".purupuru,application/zip,application/x-zip-compressed" hidden />
+  </div>
+  <noscript>
+    <p class="noscript-message">ぷるぷるPNGTuberを使うにはJavaScriptを有効にしてください。</p>
+  </noscript>
+
+  <section id="characterWizardPanel" class="character-wizard-panel guide-panel" aria-label="新キャラ作成ウィザード" hidden>
+    <div class="character-wizard-header">
+      <span id="characterWizardStepText" class="character-wizard-step">1 / 9</span>
+      <button id="characterWizardCancelButton" class="ghost-button muted-button" type="button">中止</button>
+    </div>
+    <h2 id="characterWizardTitle">顔の中心をクリック</h2>
+    <p id="characterWizardDescription" class="small-note">キャンバス上のガイドに沿って点を置いてください。</p>
+    <p id="characterWizardStatus" class="small-note character-wizard-status" role="status" aria-live="polite">顔の中心をキャンバス上でクリックしてください。</p>
+    <div class="character-wizard-view-controls" aria-label="ウィザード中の表示調整">
+      <div class="character-wizard-view-header">
+        <strong>表示調整</strong>
+        <span id="characterWizardSizeReadout">120%</span>
+      </div>
+      <div class="character-wizard-view-row">
+        <button id="characterWizardSizeDownButton" class="ghost-button muted-button" type="button">小さく</button>
+        <button id="characterWizardSizeUpButton" class="ghost-button" type="button">大きく</button>
+        <button id="characterWizardCenterButton" class="ghost-button muted-button" type="button">中央へ</button>
+      </div>
+      <div class="character-wizard-view-row is-pan-row">
+        <button id="characterWizardMoveLeftButton" class="ghost-button muted-button" type="button" aria-label="キャラを左へ移動">←</button>
+        <button id="characterWizardMoveUpButton" class="ghost-button muted-button" type="button" aria-label="キャラを上へ移動">↑</button>
+        <button id="characterWizardMoveDownButton" class="ghost-button muted-button" type="button" aria-label="キャラを下へ移動">↓</button>
+        <button id="characterWizardMoveRightButton" class="ghost-button muted-button" type="button" aria-label="キャラを右へ移動">→</button>
+      </div>
+      <p class="small-note">点が見切れる時はここでサイズと位置を調整できます。キャンバス上のマウスホイールでも拡大縮小できます。</p>
+    </div>
+    <div class="character-wizard-actions">
+      <button id="characterWizardBackButton" class="ghost-button muted-button" type="button">戻る</button>
+      <button id="characterWizardRetryButton" class="ghost-button muted-button" type="button">やり直し</button>
+      <button id="characterWizardSkipButton" class="ghost-button muted-button" type="button">スキップ</button>
+      <button id="characterWizardAutoButton" class="ghost-button" type="button">自動配置</button>
+      <button id="characterWizardOkButton" class="primary-button" type="button">この点でOK</button>
+    </div>
+  </section>
+
+  <aside class="control-card" aria-label="調整パネル">
+    <header class="control-header">
+      <div class="brand-block">
+        <p class="eyebrow">PuruPuru PNGTuber</p>
+        <h1>ぷるぷるPNGTuber</h1>
+      </div>
+      <div class="header-actions">
+        <span id="statusPill" class="status-pill" role="status" aria-live="polite">loading</span>
+        <button id="dockHideButton" class="ghost-button dock-hide-button" type="button">隠す</button>
+      </div>
+    </header>
+
+    <div class="control-sticky-area">
+      <section class="live-bar" aria-label="ライブ操作">
+        <div class="live-bar-grid">
+          <button id="mouseFollowButton" class="ghost-button header-mouse-follow-button" type="button" aria-pressed="true">マウス追従 ON</button>
+          <button id="idleMotionButton" class="ghost-button header-idle-motion-button" type="button" aria-pressed="false">待機モーション OFF</button>
+          <button id="centerButton" class="ghost-button full-width-button" type="button">正面へ戻す</button>
+          <button id="demoTalkButton" class="ghost-button" type="button" aria-pressed="false">口パクデモ OFF</button>
+          <button id="blinkButton" class="ghost-button" type="button" aria-pressed="true">まばたき ON</button>
+          <button id="micButton" class="primary-button" type="button">マイク開始</button>
+          <button id="faceTrackButton" class="ghost-button" type="button" aria-pressed="false">顔トラッキング開始</button>
+          <button id="faceCalibrateButton" class="ghost-button full-width-button" type="button">正面キャリブレーション</button>
+        </div>
+        <div class="live-readout">
+          <span>口: <strong id="mouthReadout">とじ</strong></span>
+          <span>角度: <strong id="angleReadout">0, 0</strong></span>
+        </div>
+        <p id="faceTrackStatus" class="small-note" role="status" aria-live="polite">顔トラッキング: OFF（マウス操作）</p>
+        <div class="meter" aria-label="音量メーター">
+          <span id="meterFill"></span>
+        </div>
+        <p id="audioError" class="error" role="alert" aria-live="assertive" hidden></p>
+      </section>
+
+      <nav class="workspace-tabs" aria-label="作業カテゴリ">
+        <button type="button" data-workspace-target="adjust" aria-pressed="true">調整</button>
+        <button type="button" data-workspace-target="items" aria-pressed="false">アイテム追加</button>
+        <button type="button" data-workspace-target="output" aria-pressed="false">OBS・保存</button>
+        <button type="button" data-workspace-target="advanced" aria-pressed="false">上級者</button>
+      </nav>
+    </div>
+
+    <div class="workspace-page" data-workspace-page="adjust">
+      <section class="panel guide-panel is-basic-panel">
+        <div class="panel-title">
+          <span>新キャラ設定の順番</span>
+          <strong>まずここから</strong>
+        </div>
+        <ol class="quick-guide-list">
+          <li><span>1</span>新キャラ作成で顔中心・目・口・髪を合わせる</li>
+          <li><span>2</span>かんたん調整でサイズと動きを合わせる</li>
+          <li><span>3</span>.purupuru 保存でバックアップする</li>
+        </ol>
+        <button id="characterWizardStartButton" class="primary-button full-width-button" type="button">新キャラ作成を開始</button>
+      </section>
+
+      <div class="snapshot-row">
+        <button id="saveSnapshotButton" class="ghost-button" type="button">調整前を保存</button>
+        <button id="restoreSnapshotButton" class="ghost-button muted-button" type="button">調整前に戻す</button>
+      </div>
+
+      <nav class="adjust-tabs" aria-label="調整カテゴリ">
+        <button type="button" data-adjust-target="layout" aria-pressed="true">全体</button>
+        <button type="button" data-adjust-target="face" aria-pressed="false">顔</button>
+        <button type="button" data-adjust-target="mouth" aria-pressed="false">口</button>
+        <button type="button" data-adjust-target="eyes" aria-pressed="false">目</button>
+        <button type="button" data-adjust-target="hair" aria-pressed="false">髪</button>
+        <button type="button" data-adjust-target="look" aria-pressed="false">影・色</button>
+      </nav>
+
+      <div class="adjust-page" data-adjust-page="layout">
+        <section class="panel is-basic-panel">
+          <div class="panel-title">
+            <span>配置と動き</span>
+            <strong>おすすめ</strong>
+          </div>
+          <label class="control-row">
+            <span>サイズ<small>キャラ全体の大きさ</small></span>
+            <input id="avatarSize" type="range" min="30" max="300" value="120" />
+            <output for="avatarSize">120%</output>
+          </label>
+          <label class="control-row">
+            <span>呼吸・揺れ<small>ゆっくりした待機モーション</small></span>
+            <input id="breathStrength" type="range" min="0" max="100" value="40" />
+            <output for="breathStrength">40%</output>
+          </label>
+          <label class="control-row">
+            <span>首傾け<small>アイドル時の頭の傾き</small></span>
+            <input id="rollStrength" type="range" min="0" max="100" value="1" />
+            <output for="rollStrength">1%</output>
+          </label>
+          <button id="resetPositionButton" class="ghost-button full-width-button" type="button">位置とサイズを戻す</button>
+          <p class="small-note">キャラ本体をドラッグで移動、キャラ上ホイールで拡大縮小できます。</p>
+        </section>
+        <p class="see-points">見るポイント: 画面中央にキャラが収まっているか ／ 顔や手が見切れていないか ／ 呼吸・揺れが大きすぎて目立たないか ／ 首傾けが強すぎて不自然でないか</p>
+        <button class="section-reset ghost-button muted-button" type="button" data-reset-section="layout">基準値へ戻す</button>
+      </div>
+
+      <div class="adjust-page" data-adjust-page="face" hidden>
+        <section class="panel is-motion-panel">
+          <div class="panel-title">
+            <span>可動範囲</span>
+            <strong>向ける限界</strong>
+          </div>
+          <p class="small-note">方向ボタンを押すと、その向きでキャラが止まります。横のバーを動かすと、綺麗に向ける限界がすぐ反映されます。</p>
+          <div class="control-row range-limit-row">
+            <button id="testLeftButton" class="ghost-button" type="button" aria-pressed="false">左を向く限界</button>
+            <input id="rangeLeft" type="range" min="0" max="300" value="60" aria-label="左を向く限界" />
+            <output for="rangeLeft">60%</output>
+          </div>
+          <div class="control-row range-limit-row">
+            <button id="testRightButton" class="ghost-button" type="button" aria-pressed="false">右を向く限界</button>
+            <input id="rangeRight" type="range" min="0" max="300" value="60" aria-label="右を向く限界" />
+            <output for="rangeRight">60%</output>
+          </div>
+          <div class="control-row range-limit-row">
+            <button id="testUpButton" class="ghost-button" type="button" aria-pressed="false">上を向く限界</button>
+            <input id="rangeUp" type="range" min="0" max="300" value="30" aria-label="上を向く限界" />
+            <output for="rangeUp">30%</output>
+          </div>
+          <div class="control-row range-limit-row">
+            <button id="testDownButton" class="ghost-button" type="button" aria-pressed="false">下を向く限界</button>
+            <input id="rangeDown" type="range" min="0" max="300" value="30" aria-label="下を向く限界" />
+            <output for="rangeDown">30%</output>
+          </div>
+          <button id="testCenterButton" class="ghost-button muted-button full-width-button" type="button" aria-pressed="false">中央に戻す</button>
+        </section>
+
+        <section class="panel is-motion-panel">
+          <div class="panel-title">
+            <span>顔向き</span>
+            <strong>追従</strong>
+          </div>
+          <label class="control-row">
+            <span>顔向きの強さ<small>マウス/カメラ反応量</small></span>
+            <input id="angleStrength" type="range" min="0" max="160" value="100" />
+            <output for="angleStrength">100%</output>
+          </label>
+          <label class="control-row">
+            <span>追従速度<small>向きが追いつく速さ</small></span>
+            <input id="followSpeed" type="range" min="4" max="100" value="60" />
+            <output for="followSpeed">60%</output>
+          </label>
+        </section>
+
+        <section class="panel is-motion-panel">
+          <div class="panel-title">
+            <span>形の補正</span>
+            <strong>新キャラ用</strong>
+          </div>
+          <p class="small-note">横向き・上下向きの形が弱い時だけ微調整します。</p>
+          <label class="control-row">
+            <span>ワープの効き<small>登録した変形の強さ</small></span>
+            <input id="faceWarp" type="range" min="0" max="180" value="120" />
+            <output for="faceWarp">120%</output>
+          </label>
+          <label class="control-row">
+            <span>横向きの形<small>左右向きの顔変形</small></span>
+            <input id="angleXDeform" type="range" min="0" max="200" value="30" />
+            <output for="angleXDeform">30%</output>
+          </label>
+          <label class="control-row">
+            <span>顔の立体感<small>横向き時の丸みと奥行き</small></span>
+            <input id="faceTurnDepth" type="range" min="0" max="200" value="15" />
+            <output for="faceTurnDepth">15%</output>
+          </label>
+          <label class="control-row">
+            <span>斜め向きの補正<small>横向き時の上下ねじれ</small></span>
+            <input id="faceTurnVertical" type="range" min="0" max="150" value="0" />
+            <output for="faceTurnVertical">0%</output>
+          </label>
+          <button id="diagonalFaceWarpButton" class="ghost-button full-width-button" type="button" aria-pressed="true">斜め補正 ON</button>
+          <div class="simple-grid">
+            <button id="faceDepthSetupButton" class="ghost-button" type="button" aria-pressed="false">奥行き点編集 OFF</button>
+            <button id="faceDepthAutoButton" class="ghost-button muted-button" type="button">推定配置</button>
+          </div>
+          <button id="faceDepthSetupSaveButton" class="ghost-button muted-button full-width-button" type="button">奥行き点を保存</button>
+          <p id="faceDepthSetupStatus" class="small-note">左目・右目・鼻・口・顎の5点を合わせると、立体顔補正のズレを抑えられます。</p>
+          <div class="simple-grid">
+            <button id="neckPivotSetupButton" class="ghost-button" type="button" aria-pressed="false">首支点編集 OFF</button>
+            <button id="neckPivotAutoButton" class="ghost-button muted-button" type="button">推定配置</button>
+          </div>
+          <button id="neckPivotSetupSaveButton" class="ghost-button muted-button full-width-button" type="button">首支点を保存</button>
+          <p id="neckPivotSetupStatus" class="small-note">首の付け根に支点を置くと、首元を残して頭が動くように見えます。</p>
+          <label class="control-row">
+            <span>上下向きの形<small>上下向きの顔変形</small></span>
+            <input id="angleYDeform" type="range" min="0" max="200" value="200" />
+            <output for="angleYDeform">200%</output>
+          </label>
+        </section>
+        <p class="see-points">見るポイント: 左右で目や口が潰れすぎないか ／ 下向きで顎が伸びすぎないか ／ 上向きで顔が膨らみすぎないか ／ 前髪と顔のズレが目立たないか</p>
+        <button class="section-reset ghost-button muted-button" type="button" data-reset-section="face">基準値へ戻す</button>
+      </div>
+
+      <div class="adjust-page" data-adjust-page="mouth" hidden>
+        <section class="panel is-basic-panel">
+          <div class="panel-title">
+            <span>配置と動き</span>
+            <strong>おすすめ</strong>
+          </div>
+          <label class="control-row">
+            <span>ぴょこ<small>声に反応する上下バウンス</small></span>
+            <input id="pyokoStrength" type="range" min="0" max="100" value="15" />
+            <output for="pyokoStrength">15%</output>
+          </label>
+        </section>
+
+        <section class="panel is-audio-panel">
+          <div class="panel-title">
+            <span>マイク反応</span>
+            <strong>しきい値</strong>
+          </div>
+          <label class="control-row">
+            <span>マイク感度<small>声量の増幅</small></span>
+            <input id="micGain" type="range" min="40" max="500" value="220" />
+            <output for="micGain">220%</output>
+          </label>
+          <label class="control-row">
+            <span>少し開く声量<small>口が少し開く音量</small></span>
+            <input id="mouthHalf" type="range" min="1" max="30" value="8" />
+            <output for="mouthHalf">8%</output>
+          </label>
+          <label class="control-row">
+            <span>大きく開く声量<small>口が大きく開く音量</small></span>
+            <input id="mouthFull" type="range" min="5" max="45" value="22" />
+            <output for="mouthFull">22%</output>
+          </label>
+          <label class="control-row">
+            <span>口の戻り<small>声が止まった後の戻り</small></span>
+            <input id="mouthRelease" type="range" min="4" max="45" value="18" />
+            <output for="mouthRelease">18%</output>
+          </label>
+          <p class="small-note">口は素早く開き、戻る時は少し遅れます。大きく喋った時だけ顎と頬が軽くぷにっと動きます。</p>
+        </section>
+        <p class="see-points">見るポイント: 普通の声で半開きになるか ／ 大きい声で全開になるか ／ 無音時にすぐ閉じすぎないか ／ 喋るたびに跳ねすぎないか</p>
+        <button class="section-reset ghost-button muted-button" type="button" data-reset-section="mouth">基準値へ戻す</button>
+      </div>
+
+      <div class="adjust-page" data-adjust-page="eyes" hidden>
+        <section class="panel is-visual-panel">
+          <div class="panel-title">
+            <span>瞳の位置合わせ</span>
+            <strong>瞳中心</strong>
+          </div>
+          <div class="simple-grid">
+            <button id="eyeSetupButton" class="ghost-button" type="button" aria-pressed="false">瞳位置編集 OFF</button>
+            <button id="eyeAutoDetectButton" class="ghost-button muted-button" type="button">推定配置</button>
+          </div>
+          <label class="control-row">
+            <span>うるみ範囲 横<small>歪みの横幅</small></span>
+            <input id="tearLensRadiusX" type="range" min="20" max="140" value="64" />
+            <output for="tearLensRadiusX">64px</output>
+          </label>
+          <label class="control-row">
+            <span>うるみ範囲 縦<small>歪みの縦幅</small></span>
+            <input id="tearLensRadiusY" type="range" min="15" max="110" value="46" />
+            <output for="tearLensRadiusY">46px</output>
+          </label>
+          <label class="control-row">
+            <span>左目回転<small>左目の傾き補正</small></span>
+            <input id="tearLensRotationLeft" type="range" min="-45" max="45" value="0" />
+            <output for="tearLensRotationLeft">0°</output>
+          </label>
+          <label class="control-row">
+            <span>右目回転<small>右目の傾き補正</small></span>
+            <input id="tearLensRotationRight" type="range" min="-45" max="45" value="0" />
+            <output for="tearLensRotationRight">0°</output>
+          </label>
+          <button id="eyeSetupSaveButton" class="ghost-button muted-button full-width-button" type="button">瞳位置を保存</button>
+          <p id="eyeSetupStatus" class="small-note">目全体のぷるぷる・涙レンズの中心です。黒目や虹彩の中心に合わせます。</p>
+        </section>
+
+        <section class="panel is-visual-panel">
+          <div class="panel-title">
+            <span>ハイライト</span>
+            <strong>目の光</strong>
+          </div>
+          <label class="check-row">
+            <input id="highlightEnabled" type="checkbox" checked />
+            <span>目ハイライトを表示</span>
+          </label>
+          <div class="simple-grid">
+            <button id="highlightSetupButton" class="ghost-button" type="button" aria-pressed="false">ハイライト配置 OFF</button>
+            <button id="highlightAutoPlaceButton" class="ghost-button muted-button" type="button">自動配置</button>
+          </div>
+          <label class="control-row">
+            <span>光の強さ<small>白いハイライトの濃さ</small></span>
+            <input id="highlightStrength" type="range" min="0" max="100" value="100" />
+            <output for="highlightStrength">100%</output>
+          </label>
+          <label class="control-row">
+            <span>光の大きさ<small>自動生成ハイライトの直径</small></span>
+            <input id="highlightSize" type="range" min="2" max="60" value="14" />
+            <output for="highlightSize">14px</output>
+          </label>
+          <label class="control-row">
+            <span>光の横幅<small>100%で丸、低いほど細い</small></span>
+            <input id="highlightAspect" type="range" min="40" max="160" value="90" />
+            <output for="highlightAspect">90%</output>
+          </label>
+          <label class="control-row">
+            <span>光のぷるん感<small>まばたき後のぷるん感</small></span>
+            <input id="highlightFilmWobble" type="range" min="0" max="100" value="50" />
+            <output for="highlightFilmWobble">50%</output>
+          </label>
+          <label class="check-row">
+            <input id="subHighlightEnabled" type="checkbox" />
+            <span>サブハイライトを使う</span>
+          </label>
+          <div id="subHighlightControls" hidden>
+            <label class="control-row">
+              <span>サブ光の大きさ<small>小さい補助ハイライト</small></span>
+              <input id="subHighlightSize" type="range" min="2" max="36" value="7" />
+              <output for="subHighlightSize">7px</output>
+            </label>
+            <label class="control-row">
+              <span>サブ光の横幅<small>100%で丸、低いほど細い</small></span>
+              <input id="subHighlightAspect" type="range" min="40" max="160" value="100" />
+              <output for="subHighlightAspect">100%</output>
+            </label>
+            <label class="control-row">
+              <span>サブ縦揺れ<small>メインより控えめなぷるん感</small></span>
+              <input id="subHighlightFilmWobble" type="range" min="0" max="100" value="25" />
+              <output for="subHighlightFilmWobble">25%</output>
+            </label>
+          </div>
+          <button id="highlightSetupSaveButton" class="ghost-button muted-button full-width-button" type="button">ハイライト位置を保存</button>
+          <p id="highlightSetupStatus" class="small-note">通常はPNG不要です。白い光は自動配置され、ズレる時だけハイライト配置ONで調整します。</p>
+        </section>
+
+        <section class="panel is-visual-panel">
+          <div class="panel-title">
+            <span>目のうるみ</span>
+            <strong>黒目周辺</strong>
+          </div>
+          <label class="check-row">
+            <input id="tearLensEnabled" type="checkbox" checked />
+            <span>涙レンズ歪みを使う</span>
+          </label>
+          <label class="control-row">
+            <span>うるみの強さ<small>50%で旧100%相当</small></span>
+            <input id="tearLensStrength" type="range" min="0" max="100" value="100" />
+            <output for="tearLensStrength">100%</output>
+          </label>
+          <p class="small-note">目ハイライトをOFFにしても、涙レンズ歪みは独立して動きます。</p>
+        </section>
+        <p class="see-points">見るポイント: まばたきでハイライトが潰れすぎないか ／ ハイライトが黒目からズレていないか ／ うるみが強すぎてギョロつかないか ／ 左右の目の傾きが揃っているか</p>
+        <button class="section-reset ghost-button muted-button" type="button" data-reset-section="eyes">基準値へ戻す</button>
+      </div>
+
+      <div class="adjust-page" data-adjust-page="hair" hidden>
+        <section class="panel is-basic-panel">
+          <div class="panel-title">
+            <span>配置と動き</span>
+            <strong>おすすめ</strong>
+          </div>
+          <label class="check-row">
+            <input id="hairVisible" type="checkbox" checked />
+            <span>髪を表示<small>OFFで元の前髪・後ろ髪だけ隠す</small></span>
+          </label>
+          <label class="control-row">
+            <span>髪の揺れ<small>髪の追従差と声反応</small></span>
+            <input id="hairWarp" type="range" min="0" max="200" value="150" />
+            <output for="hairWarp">150%</output>
+          </label>
+          <label class="control-row">
+            <span>髪の遅れ感<small>遅れと伸びの強さ</small></span>
+            <input id="hairSpring" type="range" min="0" max="200" value="20" />
+            <output for="hairSpring">20%</output>
+          </label>
+          <label class="control-row">
+            <span>髪束ごとの揺れ<small>束ごとの別揺れの効き</small></span>
+            <input id="hairBundleStrength" type="range" min="0" max="150" value="100" />
+            <output for="hairBundleStrength">100%</output>
+          </label>
+          <label class="select-row">
+            <span>髪束の表示<small>線が多い時は絞る</small></span>
+            <select id="hairBundleFocusSelect">
+              <option value="all" selected>全て表示</option>
+              <option value="front">前髪だけ</option>
+              <option value="side">横髪だけ</option>
+              <option value="back">後ろ髪だけ</option>
+            </select>
+          </label>
+          <div class="simple-grid">
+            <button id="hairBundleSetupButton" class="ghost-button" type="button" aria-pressed="false">髪束編集 OFF</button>
+            <button id="hairBundleTemplateButton" class="ghost-button muted-button" type="button">標準テンプレ</button>
+          </div>
+          <button id="hairBundleSetupSaveButton" class="ghost-button muted-button full-width-button" type="button">髪束を保存</button>
+          <p id="hairBundleSetupStatus" class="small-note">髪束編集ONで、線に「前髪 左」「横髪 右」「後ろ髪 中央」などのラベルが出ます。迷う時は髪束の表示を「前髪だけ」などに絞れます。</p>
+        </section>
+        <p class="see-points">見るポイント: 顔の動きより少し遅れて髪が動くか ／ 髪がゴムのように伸びすぎないか ／ 前髪だけ変に揺れていないか ／ 後ろ髪が一枚板に見えないか</p>
+        <button class="section-reset ghost-button muted-button" type="button" data-reset-section="hair">基準値へ戻す</button>
+      </div>
+
+      <div class="adjust-page" data-adjust-page="look" hidden>
+        <section class="panel is-basic-panel">
+          <div class="panel-title">
+            <span>配置と動き</span>
+            <strong>おすすめ</strong>
+          </div>
+          <label class="check-row">
+            <input id="frontHairShadowEnabled" type="checkbox" checked />
+            <span>前髪影</span>
+          </label>
+          <label class="control-row">
+            <span>前髪影の濃さ<small>顔に落ちる影の強さ</small></span>
+            <input id="frontHairShadowStrength" type="range" min="0" max="100" value="28" />
+            <output for="frontHairShadowStrength">28%</output>
+          </label>
+          <label class="control-row">
+            <span>前髪影の距離<small>前髪から影を落とす距離</small></span>
+            <input id="frontHairShadowDistance" type="range" min="0" max="32" value="10" />
+            <output for="frontHairShadowDistance">10px</output>
+          </label>
+        </section>
+
+        <section class="panel is-visual-panel">
+          <div class="panel-title">
+            <span>背景色</span>
+            <strong id="backgroundReadout">クリーム</strong>
+          </div>
+          <div class="color-preset-grid" role="group" aria-label="背景色プリセット">
+            <button class="color-preset-button" type="button" data-bg="#FFF8EE" aria-pressed="true">
+              <span></span>
+              クリーム
+            </button>
+            <button class="color-preset-button" type="button" data-bg="#FDEFEF" aria-pressed="false">
+              <span></span>
+              さくら
+            </button>
+            <button class="color-preset-button" type="button" data-bg="#00FF00" aria-pressed="false">
+              <span></span>
+              クロマキー
+            </button>
+            <button class="color-preset-button" type="button" data-bg="#2B2926" aria-pressed="false">
+              <span></span>
+              ナイト
+            </button>
+          </div>
+          <label class="select-row color-picker-row">
+            <span>自由色<small>背景を好きな色にします</small></span>
+            <input id="backgroundColorInput" class="color-input" type="color" value="#FFF8EE" />
+          </label>
+        </section>
+
+        <section class="panel is-visual-panel">
+          <div class="panel-title">
+            <span>髪色</span>
+            <strong id="hairColorReadout">元色</strong>
+          </div>
+          <label class="select-row color-picker-row">
+            <span>自由色<small>髪の色相を選びます</small></span>
+            <input id="hairColorInput" class="color-input" type="color" value="#2C292C" />
+          </label>
+          <label class="control-row">
+            <span>髪色の明るさ<small>淡い色・パステル用</small></span>
+            <input id="hairTintLightness" type="range" min="0" max="100" value="0" />
+            <output for="hairTintLightness">0%</output>
+          </label>
+          <button id="hairColorReset" class="ghost-button muted-button full-width-button" type="button" aria-pressed="true">元の髪色に戻す</button>
+        </section>
+        <p class="see-points">見るポイント: 前髪影が濃すぎて顔が汚くなっていないか ／ 背景色がクロマキー抜きで残らないか ／ 髪色が元のPNGと極端に変わっていないか ／ パステルにしても白飛びしないか</p>
+        <button class="section-reset ghost-button muted-button" type="button" data-reset-section="look">基準値へ戻す</button>
+      </div>
+    </div>
+
+    <div class="workspace-page" data-workspace-page="items" hidden>
+      <section class="panel is-item-panel">
+        <div class="panel-title">
+          <span>アイテムの追加</span>
+          <strong id="itemFileReadout">未追加</strong>
+        </div>
+        <p class="small-note">PNGアイテムを追加・PNGをここにドラッグ＆ドロップ、またはクリックして選択できます。</p>
+        <div class="drop-zone" id="itemDropZone" role="button" tabindex="0">PNGをここにドラッグ＆ドロップ<br />またはクリックして選択</div>
+        <input id="itemFileInput" type="file" accept="image/png,.png" multiple hidden />
+        <p id="itemStatus" class="small-note">PNGだけ追加できます。PNGアイテムは .purupuru に画像込みで保存されます。</p>
+      </section>
+
+      <section class="panel is-item-panel">
+        <div class="panel-title">
+          <span>アイテム一覧</span>
+          <strong id="itemLayerReadout">0個</strong>
+        </div>
+        <div class="item-list" id="itemLayerList" aria-label="追加アイテム一覧"></div>
+        <p class="small-note">同じ重なり位置では、一覧で上にあるアイテムほど前面に表示されます。</p>
+      </section>
+
+      <section class="panel is-item-panel">
+        <div class="panel-title">
+          <span>選択中アイテムの調整</span>
+          <strong id="itemSelectedReadout">未選択</strong>
+        </div>
+        <label class="select-row">
+          <span>重なり位置<small>キャラとの前後関係</small></span>
+          <select id="itemSlotSelect">
+            <option value="stageBack">背景固定</option>
+            <option value="characterBack">キャラ背面</option>
+            <option value="faceBack">顔の後ろ・後ろ髪の前</option>
+            <option value="faceFront">顔の前・前髪の下</option>
+            <option value="frontHairFront" selected>前髪の前</option>
+            <option value="stageFront">画面最前面</option>
+          </select>
+        </label>
+        <label class="check-row">
+          <input id="itemDeformFollowEnabled" type="checkbox" />
+          <span>顔・髪の変形にも連動<small>OFF: サングラス・ヘアピン向け / ON: ウィッグ・髪束向け</small></span>
+        </label>
+        <label class="control-row">
+          <span>顔・髪への追従度<small>横向き時の移動量を調整</small></span>
+          <input id="itemFollowStrength" type="range" min="0" max="200" value="100" />
+          <output for="itemFollowStrength">100%</output>
+        </label>
+        <label class="control-row">
+          <span>サイズ</span>
+          <input id="itemScale" type="range" min="10" max="500" value="100" />
+          <output for="itemScale">100%</output>
+        </label>
+        <label class="control-row">
+          <span>回転</span>
+          <input id="itemRotation" type="range" min="-180" max="180" value="0" />
+          <output for="itemRotation">0°</output>
+        </label>
+        <label class="control-row">
+          <span>X位置</span>
+          <input id="itemX" type="range" min="-3000" max="3000" value="0" />
+          <output for="itemX">0px</output>
+        </label>
+        <label class="control-row">
+          <span>Y位置</span>
+          <input id="itemY" type="range" min="-3000" max="3000" value="0" />
+          <output for="itemY">0px</output>
+        </label>
+        <label class="control-row">
+          <span>不透明度</span>
+          <input id="itemOpacity" type="range" min="10" max="100" value="100" />
+          <output for="itemOpacity">100%</output>
+        </label>
+        <div class="simple-grid">
+          <button id="itemCenterButton" class="ghost-button" type="button">中央へ</button>
+          <button id="itemDuplicateButton" class="ghost-button" type="button">複製</button>
+        </div>
+        <button id="itemDeleteButton" class="ghost-button muted-button danger-button full-width-button" type="button">選択アイテムを削除</button>
+        <button id="itemDeleteAllButton" class="ghost-button muted-button danger-button full-width-button" type="button">追加アイテムを全削除</button>
+        <p class="small-note">キャンバス上でドラッグ移動できます。選択中アイテムの右上◆でサイズ変更できます。</p>
+      </section>
+    </div>
+
+    <div class="workspace-page" data-workspace-page="output" hidden>
+      <section class="panel guide-panel is-basic-panel" id="obsPanel">
+        <div class="panel-title">
+          <span>OBSに出す</span>
+          <strong>配信用</strong>
+        </div>
+        <p class="small-note">OBS Browser Sourceには固定URLを一度だけ貼ります。プリセット変更は通常画面からOBSへ自動反映されます。</p>
+        <div class="simple-grid obs-preset-grid" aria-label="OBSプリセット">
+          <button class="ghost-button obs-preset-button" type="button" data-obs-preset="light" aria-pressed="true">軽量</button>
+          <button class="ghost-button obs-preset-button muted-button" type="button" data-obs-preset="standard" aria-pressed="false">標準</button>
+          <button class="ghost-button obs-preset-button muted-button" type="button" data-obs-preset="high" aria-pressed="false">高品質</button>
+        </div>
+        <p id="obsPresetHint" class="small-note">選択中: 軽量 / OBS 960x540 / 表示30fps / 送信20fps</p>
+        <button id="copyObsUrlButton" class="ghost-button full-width-button" type="button">OBS用URLをコピー</button>
+        <button id="pushObsSnapshotButton" class="ghost-button full-width-button" type="button">現在のキャラをOBSへ反映</button>
+        <button id="obsPublishButton" class="ghost-button full-width-button" type="button" aria-pressed="false">OBS連携 OFF</button>
+        <p id="obsUrlPreview" class="small-note code-note">http://127.0.0.1:8223/?mode=obs&amp;transparent=1</p>
+        <p id="obsStatus" class="small-note">軽量はOBS Browser Source 幅960 / 高さ540 / FPS30推奨です。通常画面を開いたままOBS連携ONにすると口パク・顔向きを送信します。</p>
+      </section>
+
+      <section class="panel guide-panel is-basic-panel" id="allSettingsPanel">
+        <div class="panel-title">
+          <span>アバターファイル</span>
+          <strong>保存・読込</strong>
+        </div>
+        <p class="small-note">キャラPNG、調整値、背景色、髪色、瞳位置、ハイライト位置、ワープ編集、PNGアイテム、OBSプリセットを .purupuru ファイルにまとめて保存・読み込みします。顔向き・可動範囲・顔の立体感と、PNGアイテムの位置/サイズ/回転/不透明度も含まれます。</p>
+        <div class="simple-grid">
+          <button id="savePuruPuruButton" class="ghost-button" type="button">.purupuru 保存</button>
+          <button id="loadPuruPuruButton" class="ghost-button muted-button" type="button">このキャラを置き換え</button>
+        </div>
+        <p class="small-note">保存・読み込みは .purupuru 形式に統一しました。</p>
+        <input id="allSettingsFileInput" type="file" accept=".purupuru,application/zip,application/x-zip-compressed" hidden />
+      </section>
+
+      <section class="panel guide-panel is-basic-panel">
+        <div class="panel-title">
+          <span>基準値</span>
+          <strong>baseline</strong>
+        </div>
+        <p class="small-note">今の調整状態を基準値として保存します。各調整ページの「基準値へ戻す」でこの状態に復元でき、変更した項目に「変更済み」が付きます。</p>
+        <button id="captureBaselineButton" class="ghost-button full-width-button" type="button">現在を基準値として保存</button>
+      </section>
+    </div>
+
+    <div class="workspace-page" data-workspace-page="advanced" hidden>
+      <section class="panel is-advanced-panel">
+        <div class="panel-title">
+          <span>上級者向けワープ編集（β版）</span>
+          <strong>上級者向け</strong>
+        </div>
+        <p class="small-note">形を直接変える上級者向け項目です。この欄のワープ保存/読込はデフォーマ編集だけが対象です。全体の保存は「アバターファイル」の .purupuru 保存を使います。</p>
+        <label class="check-row">
+          <input id="showMesh" type="checkbox" />
+          <span>顔メッシュ目安を表示</span>
+        </label>
+        <button id="editModeButton" class="ghost-button full-width-button" type="button" aria-pressed="false">編集モード OFF</button>
+        <label class="select-row">
+          <span>レイヤー<small>編集するPNG</small></span>
+          <select id="editLayerSelect">
+            <option value="face">顔</option>
+            <option value="frontHair">前髪</option>
+            <option value="backHair">後ろ髪</option>
+          </select>
+        </label>
+        <label class="select-row">
+          <span>キー<small>向きの登録点</small></span>
+          <select id="editKeySelect">
+            <option value="center">正面</option>
+            <option value="left">左</option>
+            <option value="right">右</option>
+            <option value="up">上</option>
+            <option value="down">下</option>
+          </select>
+        </label>
+        <div class="simple-grid">
+          <button id="resetEditKeyButton" class="ghost-button muted-button" type="button">キー初期化</button>
+          <button id="saveDeformerButton" class="ghost-button" type="button">ワープ保存</button>
+        </div>
+        <div class="simple-grid">
+          <button id="loadDeformerButton" class="ghost-button muted-button" type="button">ワープ読込</button>
+          <button id="resetAllDeformersButton" class="ghost-button muted-button danger-button" type="button">全初期化</button>
+        </div>
+        <p id="editStatus" class="small-note">編集モードONで、表示中の格子点をドラッグできます。</p>
+      </section>
+    </div>
+  </aside>
+
+  <button id="dockPeekButton" class="dock-peek-button" type="button" aria-expanded="false">Controls</button>
+
+  <script src="./app.js" defer></script>
+</body>
+</html>

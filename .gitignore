@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node / tooling
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.agents/
+
+# Logs and coverage
+*.log
+coverage/
+htmlcov/
+
+# Build / distribution
+dist/
+build/
+
+# Local settings and generated app data
+settings/
+*.purupuru
+!tests/fixtures/**/*.purupuru
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project-specific temporary assets
+assets/*_backup_*/
+*_backup_*/
+*_backup_????????_??????/
+
+# Internal review notes (not for public release)
+docs/reviews/

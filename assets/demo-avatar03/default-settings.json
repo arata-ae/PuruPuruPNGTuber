@@ -1,0 +1,295 @@
+{
+  "app": "PuruPuru PNGTuber",
+  "type": "purupuru-pngtuber-settings",
+  "version": 2,
+  "savedAt": "2026-07-01T09:40:00+09:00",
+  "avatarImageSize": {
+    "width": 1024,
+    "height": 1024
+  },
+  "state": {
+    "angleStrength": 100,
+    "faceWarp": 95,
+    "angleXDeform": 45,
+    "faceTurnDepth": 120,
+    "faceTurnVertical": 80,
+    "angleYDeform": 160,
+    "hairWarp": 115,
+    "hairSpring": 24,
+    "hairBundleStrength": 100,
+    "frontHairShadowStrength": 45,
+    "frontHairShadowDistance": 8,
+    "followSpeed": 60,
+    "rangeLeft": 55,
+    "rangeRight": 55,
+    "rangeUp": 18,
+    "rangeDown": 24,
+    "avatarSize": 78,
+    "avatarX": -155,
+    "avatarY": 4,
+    "breathStrength": 40,
+    "rollStrength": 1,
+    "pyokoStrength": 15,
+    "highlightEnabled": true,
+    "highlightStrength": 80,
+    "highlightFilmWobble": 35,
+    "highlightSize": 12,
+    "highlightAspect": 75,
+    "subHighlightEnabled": false,
+    "subHighlightSize": 6,
+    "subHighlightAspect": 85,
+    "subHighlightFilmWobble": 20,
+    "highlightAlphaOnBlink": true,
+    "tearLensEnabled": true,
+    "tearLensStrength": 80,
+    "tearLensRadiusX": 46,
+    "tearLensRadiusY": 32,
+    "tearLensRotationLeft": 0,
+    "tearLensRotationRight": 0,
+    "frontHairShadowEnabled": true,
+    "bgColor": "#FFF8EE",
+    "hairColor": "#2C292C",
+    "hairTintLightness": 0,
+    "hairTintEnabled": false,
+    "showMesh": false,
+    "editLayer": "face",
+    "editKey": "center",
+    "autoBlink": true,
+    "mouseFollowEnabled": true,
+    "idleMotionEnabled": false,
+    "diagonalFaceWarpEnabled": true,
+    "wobbleSeed": 0.18,
+    "micGain": 220,
+    "mouthHalf": 8,
+    "mouthFull": 22,
+    "mouthRelease": 18
+  },
+  "outputSettings": {
+    "obsPreset": "standard"
+  },
+  "faceCenterSetup": {
+    "version": 1,
+    "center": {
+      "x": 512,
+      "y": 286
+    }
+  },
+  "eyeSetup": {
+    "version": 2,
+    "centers": [
+      {
+        "x": 447,
+        "y": 344
+      },
+      {
+        "x": 588,
+        "y": 344
+      }
+    ],
+    "radius": {
+      "x": 46,
+      "y": 32
+    },
+    "rotationLeft": 0,
+    "rotationRight": 0
+  },
+  "faceDepthSetup": {
+    "version": 1,
+    "anchors": {
+      "leftEye": {
+        "x": 447,
+        "y": 344
+      },
+      "rightEye": {
+        "x": 588,
+        "y": 344
+      },
+      "nose": {
+        "x": 512,
+        "y": 393
+      },
+      "mouth": {
+        "x": 517,
+        "y": 433
+      },
+      "chin": {
+        "x": 512,
+        "y": 485
+      }
+    }
+  },
+  "neckPivotSetup": {
+    "version": 1,
+    "pivot": {
+      "x": 512,
+      "y": 532
+    }
+  },
+  "hairBundleSetup": {
+    "version": 1,
+    "bundles": {
+      "frontLeft": {
+        "root": {
+          "x": 408,
+          "y": 112
+        },
+        "tip": {
+          "x": 373,
+          "y": 575
+        }
+      },
+      "frontCenter": {
+        "root": {
+          "x": 512,
+          "y": 86
+        },
+        "tip": {
+          "x": 510,
+          "y": 350
+        }
+      },
+      "frontRight": {
+        "root": {
+          "x": 626,
+          "y": 112
+        },
+        "tip": {
+          "x": 646,
+          "y": 575
+        }
+      },
+      "sideLeft": {
+        "root": {
+          "x": 265,
+          "y": 195
+        },
+        "tip": {
+          "x": 187,
+          "y": 950
+        }
+      },
+      "sideRight": {
+        "root": {
+          "x": 759,
+          "y": 195
+        },
+        "tip": {
+          "x": 837,
+          "y": 950
+        }
+      },
+      "backLeft": {
+        "root": {
+          "x": 330,
+          "y": 105
+        },
+        "tip": {
+          "x": 215,
+          "y": 980
+        }
+      },
+      "backCenter": {
+        "root": {
+          "x": 512,
+          "y": 76
+        },
+        "tip": {
+          "x": 512,
+          "y": 930
+        }
+      },
+      "backRight": {
+        "root": {
+          "x": 694,
+          "y": 105
+        },
+        "tip": {
+          "x": 810,
+          "y": 980
+        }
+      }
+    }
+  },
+  "highlightSetup": {
+    "version": 2,
+    "points": [
+      {
+        "x": 442,
+        "y": 339
+      },
+      {
+        "x": 586,
+        "y": 339
+      }
+    ],
+    "subPoints": [
+      {
+        "x": 457,
+        "y": 351
+      },
+      {
+        "x": 601,
+        "y": 351
+      }
+    ],
+    "size": 12,
+    "aspect": 75,
+    "subEnabled": false,
+    "subSize": 6,
+    "subAspect": 85,
+    "subFilmWobble": 20
+  },
+  "activeItemLayerId": 1,
+  "itemLayers": [
+    {
+      "id": 1,
+      "label": "#1 body.png",
+      "name": "body.png",
+      "src": null,
+      "slot": "faceBack",
+      "x": 0,
+      "y": -5,
+      "scale": 103,
+      "rotation": 0,
+      "opacity": 100,
+      "visible": true,
+      "locked": true,
+      "file": "items/body.png"
+    },
+    {
+      "id": 2,
+      "label": "#2 ribbon.png",
+      "name": "ribbon.png",
+      "src": null,
+      "slot": "faceBack",
+      "x": 0,
+      "y": 0,
+      "scale": 100,
+      "rotation": 0,
+      "opacity": 100,
+      "followStrength": 85,
+      "deformFollowEnabled": false,
+      "visible": true,
+      "locked": true,
+      "file": "items/ribbon.png"
+    },
+    {
+      "id": 3,
+      "label": "#3 hairpin.png",
+      "name": "hairpin.png",
+      "src": null,
+      "slot": "frontHairFront",
+      "x": 0,
+      "y": 0,
+      "scale": 100,
+      "rotation": 0,
+      "opacity": 100,
+      "followStrength": 75,
+      "deformFollowEnabled": false,
+      "visible": true,
+      "locked": true,
+      "file": "items/hairpin.png"
+    }
+  ],
+  "packageVersion": 1
+}
