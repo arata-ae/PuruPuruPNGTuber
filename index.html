@@ -686,6 +686,19 @@
           <input id="showMesh" type="checkbox" />
           <span>顔メッシュ目安を表示</span>
         </label>
+        <label class="select-row">
+          <span>描画方式<small>WebGPU対応ブラウザでは自動で使います</small></span>
+          <select id="rendererModeSelect">
+            <option value="auto">自動</option>
+            <option value="webgpu">WebGPU</option>
+            <option value="canvas">Canvas/WebGL</option>
+          </select>
+        </label>
+        <label class="control-row">
+          <span>アニメFPS<small>通常画面の描画上限</small></span>
+          <input id="activeAnimationFps" type="range" min="12" max="60" value="24" />
+          <output for="activeAnimationFps">24fps</output>
+        </label>
         <button id="editModeButton" class="ghost-button full-width-button" type="button" aria-pressed="false">編集モード OFF</button>
         <label class="select-row">
           <span>レイヤー<small>編集するPNG</small></span>

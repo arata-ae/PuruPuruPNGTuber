@@ -36,6 +36,11 @@
   const OBS_TRANSPARENT = OBS_MODE && URL_PARAMS.get("transparent") !== "0";
   const OBS_TARGET_FPS = 0;
   const OBS_QUALITY = "";
+  const RENDERER_MODE_STORAGE_KEY = "purupuru-pngtuber-renderer-mode-v1";
+  const RENDERER_MODES = new Set(["auto", "webgpu", "canvas"]);
+  const ACTIVE_ANIMATION_FPS_MIN = 12;
+  const ACTIVE_ANIMATION_FPS_MAX = 60;
+  const ACTIVE_ANIMATION_FPS_DEFAULT = 24;
 
   const ASSETS = {
     backHair: "assets/demo-avatar/back-hair.png",
@@ -217,6 +222,7 @@
     "mouthHalf",
     "mouthFull",
     "mouthRelease",
+    "activeAnimationFps",
   ];
   const ALL_SETTINGS_BOOLEAN_KEYS = [
     "highlightEnabled",
@@ -249,8 +255,10 @@
   const SPECIAL_STATE_SETTING_KEYS = new Set(["bgColor", "hairColor", "editLayer", "editKey"]);
   const STATE_NUMERIC_LIMITS = {
     wobbleSeed: { min: 0, max: 1, integer: false },
+    activeAnimationFps: { min: ACTIVE_ANIMATION_FPS_MIN, max: ACTIVE_ANIMATION_FPS_MAX, integer: true },
   };
   const RANGE_CONTROL_SUFFIXES = {
+    activeAnimationFps: "fps",
     highlightSize: "px",
     subHighlightSize: "px",
     frontHairShadowDistance: "px",
@@ -334,6 +342,7 @@
     mouthHalf: 8,
     mouthFull: 22,
     mouthRelease: 18,
+    activeAnimationFps: ACTIVE_ANIMATION_FPS_DEFAULT,
   };
 
   function showStartupError(message) {
@@ -349,12 +358,72 @@
     if (!existing) panel.append(error);
   }
 
+  function normalizeRendererMode(value) {
+    const mode = String(value || "auto").toLowerCase();
+    return RENDERER_MODES.has(mode) ? mode : "auto";
+  }
+
+  function readRendererMode() {
+    try {
+      return normalizeRendererMode(localStorage.getItem(RENDERER_MODE_STORAGE_KEY));
+    } catch {
+      return "auto";
+    }
+  }
+
+  function rememberRendererMode(value) {
+    try {
+      localStorage.setItem(RENDERER_MODE_STORAGE_KEY, normalizeRendererMode(value));
+    } catch {}
+  }
+
+  function rendererModeAllowsWebGpu() {
+    return rendererMode === "auto" || rendererMode === "webgpu";
+  }
+
+  function rendererKindLabel(kind = activeRendererKind) {
+    return kind === "webgpu" ? "WebGPU" : "Canvas/WebGL";
+  }
+
+  function syncRendererModeUi() {
+    if (ui.rendererModeSelect) ui.rendererModeSelect.value = rendererMode;
+    const help = ui.rendererModeSelect?.closest(".select-row")?.querySelector("small");
+    if (help) {
+      help.textContent = rendererMode === "auto" ? "自動: " + rendererKindLabel() : rendererKindLabel() + "で描画中";
+    }
+  }
+
+  function setRendererMode(value) {
+    rendererMode = normalizeRendererMode(value);
+    rememberRendererMode(rendererMode);
+    syncRendererModeUi();
+    resetMeshRendererAfterAvatarImageChange();
+  }
+
+  function activeAnimationFps() {
+    return Math.round(clamp(Number(state.activeAnimationFps) || ACTIVE_ANIMATION_FPS_DEFAULT, ACTIVE_ANIMATION_FPS_MIN, ACTIVE_ANIMATION_FPS_MAX));
+  }
+
+  function activeAnimationFrameDelayMs() {
+    return 1000 / activeAnimationFps();
+  }
+
   const canvas = document.querySelector("#stage");
   const ctx = canvas?.getContext?.("2d") || null;
   if (!canvas || !ctx) {
     showStartupError("このブラウザはCanvas 2Dに対応していません。Chrome または Chromium 系の新しいブラウザでお試しください。");
     return;
   }
+  const stageArtCanvas = document.createElement("canvas");
+  stageArtCanvas.className = "ppt-stage-art";
+  stageArtCanvas.setAttribute("aria-hidden", "true");
+  stageArtCanvas.hidden = true;
+  canvas.before(stageArtCanvas);
+
+  function setStageArtVisible(visible) {
+    stageArtCanvas.hidden = !visible;
+  }
+
   const charCanvas = document.createElement("canvas");
   charCanvas.width = CROP.w;
   charCanvas.height = CROP.h;
@@ -386,6 +455,17 @@
     return;
   }
   let meshRenderer = null;
+  let meshRendererGeneration = 0;
+  let rendererMode = readRendererMode();
+  let activeRendererKind = "canvas";
+  let rendererFallbackRequested = false;
+  let frontHairShadowCompositeFrame = -1;
+  let faceGpuWarpSpecCacheFrame = -1;
+  let faceGpuWarpSpecCache = null;
+  let hairGpuWarpSpecCacheFrame = -1;
+  let hairGpuWarpSpecCache = null;
+  let highlightGpuWarpSpecCacheFrame = -1;
+  let highlightGpuWarpSpecCache = null;
 
   const ui = {
     statusPill: document.querySelector("#statusPill"),
@@ -455,6 +535,8 @@
     mouthReadout: document.querySelector("#mouthReadout"),
     angleReadout: document.querySelector("#angleReadout"),
     showMesh: document.querySelector("#showMesh"),
+    rendererModeSelect: document.querySelector("#rendererModeSelect"),
+    activeAnimationFps: document.querySelector("#activeAnimationFps"),
     avatarSizeInput: document.querySelector("#avatarSize"),
     resetPositionButton: document.querySelector("#resetPositionButton"),
     hairColorInput: document.querySelector("#hairColorInput"),
@@ -600,6 +682,9 @@
   let resizePending = false;
   let lastTimestamp = 0;
   let obsLastFrameAt = 0;
+  let activeAnimationLastFrameAt = 0;
+  let tickRafId = 0;
+  let tickTimerId = 0;
   let obsPublishEnabled = false;
   let obsPresetKey = DEFAULT_OBS_PRESET;
   let obsInputPostPending = false;
@@ -1625,18 +1710,52 @@
     return true;
   }
 
-  function resetMeshRendererAfterAvatarImageChange() {
+  async function resetMeshRendererAfterAvatarImageChange() {
+    const generation = meshRendererGeneration + 1;
+    meshRendererGeneration = generation;
     try {
       meshRenderer?.dispose?.();
     } catch (error) {
       console.warn("meshRenderer dispose failed", error);
     }
+    meshRenderer = null;
+    activeRendererKind = "canvas";
+    setStageArtVisible(false);
+    syncRendererModeUi();
+
+    if (rendererModeAllowsWebGpu()) {
+      try {
+        const renderer = await createWebGpuMeshRenderer(CROP.w, CROP.h);
+        if (generation !== meshRendererGeneration) {
+          renderer?.dispose?.();
+          return;
+        }
+        if (renderer) {
+          meshRenderer = renderer;
+          activeRendererKind = "webgpu";
+          setStageArtVisible(true);
+          syncRendererModeUi();
+          return;
+        }
+      } catch (error) {
+        if (rendererMode === "webgpu") {
+          console.warn("WebGPUメッシュ初期化に失敗したためCanvas描画で続行します。", error);
+        }
+      }
+    }
+
+    if (generation !== meshRendererGeneration) return;
     try {
       meshRenderer = createMeshRenderer(CROP.w, CROP.h);
+      activeRendererKind = "canvas";
+      setStageArtVisible(false);
     } catch (error) {
       console.warn("WebGLメッシュ初期化に失敗したためCanvas描画で続行します。", error);
       meshRenderer = null;
+      activeRendererKind = "canvas";
+      setStageArtVisible(false);
     }
+    syncRendererModeUi();
   }
 
   function applyLoadedAvatarImages(loadedImages) {
@@ -3599,9 +3718,15 @@
       if (forceSettings || characterDirty.settings) {
         patch.settingsPayload = buildAllSettingsPayload({ includeItemImages: false, includeBaseline: true });
       }
-      if (forceAssets || characterDirty.avatarImages) patch.avatarImageBlobs = await collectAvatarImageBlobsFromRuntime();
-      if (forceAssets || characterDirty.itemImages) patch.itemImageBlobs = collectItemImageBlobsFromRuntime();
-      if (forceAssets || characterDirty.thumbnail || characterDirty.settings) patch.thumbnailDataUrl = await captureCharacterThumbnailDataUrl();
+      if (forceAssets || characterDirty.avatarImages) {
+        patch.avatarImageBlobs = await collectAvatarImageBlobsFromRuntime();
+      }
+      if (forceAssets || characterDirty.itemImages) {
+        patch.itemImageBlobs = collectItemImageBlobsFromRuntime();
+      }
+      if (forceAssets || characterDirty.thumbnail || characterDirty.settings) {
+        patch.thumbnailDataUrl = await captureCharacterThumbnailDataUrl();
+      }
       await patchCharacterProfile(activeCharacterId, patch);
       characterDirty = { settings: false, avatarImages: false, itemImages: false, thumbnail: false };
       updateCharacterSaveStatus("保存済み");
@@ -6305,6 +6430,2363 @@
     targetCtx.restore();
   }
 
+  const MESH_GPU_BUFFER_USAGE_COPY_DST = 0x0008;
+  const MESH_GPU_BUFFER_USAGE_VERTEX = 0x0020;
+  const MESH_GPU_BUFFER_USAGE_UNIFORM = 0x0040;
+  const MESH_GPU_BUFFER_USAGE_STORAGE = 0x0080;
+  const MESH_GPU_TEXTURE_USAGE_COPY_DST = 0x0002;
+  const MESH_GPU_TEXTURE_USAGE_TEXTURE_BINDING = 0x0004;
+  const MESH_GPU_TEXTURE_USAGE_RENDER_ATTACHMENT = 0x0010;
+  const MESH_TEXTURE_CACHE_LIMIT = 48;
+  const MESH_FACE_UNIFORM_VEC4_COUNT = 24;
+  const MESH_FACE_CONTROL_POINT_COUNT = 25;
+  const MESH_HAIR_UNIFORM_VEC4_COUNT = 8;
+  const MESH_HAIR_SPRING_VEC4_COUNT = HAIR_SPRING_BUCKETS * 3;
+  const MESH_HAIR_BUNDLE_DEF_VEC4_COUNT = HAIR_BUNDLE_DEFS.length * 2;
+  const MESH_HAIR_BUNDLE_SAMPLE_VEC4_COUNT = HAIR_BUNDLE_DEFS.length * HAIR_SPRING_BUCKETS * 3;
+  const MESH_WEBGPU_SHADER = /* wgsl */ `
+    struct MeshUniforms {
+      resolution: vec2f,
+      stageResolution: vec2f,
+      stageTransform0: vec4f,
+      stageTransform1: vec4f,
+    };
+
+    struct VertexOut {
+      @builtin(position) position: vec4f,
+      @location(0) uv: vec2f,
+    };
+
+    @group(0) @binding(0) var<uniform> uniforms: MeshUniforms;
+    @group(0) @binding(1) var imageSampler: sampler;
+    @group(0) @binding(2) var imageTexture: texture_2d<f32>;
+
+    struct FaceUniforms {
+      p: array<vec4f, 24>,
+    };
+
+    @group(0) @binding(3) var<uniform> face: FaceUniforms;
+    @group(0) @binding(4) var<storage, read> faceControlPoints: array<vec2f>;
+
+    struct HairUniforms {
+      p: array<vec4f, 8>,
+    };
+
+    @group(0) @binding(5) var<storage, read> faceRootControlPoints: array<vec2f>;
+    @group(0) @binding(6) var<uniform> hair: HairUniforms;
+    @group(0) @binding(7) var<storage, read> hairSpringSamples: array<vec4f>;
+    @group(0) @binding(8) var<storage, read> hairBundleDefs: array<vec4f>;
+    @group(0) @binding(9) var<storage, read> hairBundleSamples: array<vec4f>;
+
+    struct HairSpringSample {
+      anglePos: f32,
+      anglePosY: f32,
+      waveX: f32,
+      waveY: f32,
+      headPosX: f32,
+      headPosY: f32,
+      headVelX: f32,
+      headVelY: f32,
+      angleVel: f32,
+      angleVelY: f32,
+      stretchX: f32,
+      stretchY: f32,
+    };
+
+    struct HairBundleMotion {
+      spring: HairSpringSample,
+      mask: f32,
+      motionScale: f32,
+      edgeScale: f32,
+    };
+
+    fn clamp01(value: f32) -> f32 {
+      return clamp(value, 0.0, 1.0);
+    }
+
+    fn lerp2(a: vec2f, b: vec2f, t: f32) -> vec2f {
+      return a + (b - a) * t;
+    }
+
+    fn faceFeatureMask(point: vec2f, center: vec2f, radius: vec2f) -> f32 {
+      let delta = (point - center) / max(radius, vec2f(1.0, 1.0));
+      return 1.0 - smoothstep(0.72, 1.06, length(delta));
+    }
+
+    fn faceHeadMask(point: vec2f) -> f32 {
+      let metricsCenter = face.p[1].zw;
+      let radius = face.p[2].xy;
+      let topY = face.p[2].z;
+      let bottomY = face.p[2].w;
+      let u = (point.x - metricsCenter.x) / max(1.0, radius.x);
+      let v = (point.y - metricsCenter.y) / max(1.0, radius.y);
+      let dist = sqrt(u * u * 0.94 + v * v * 1.04);
+      let ellipse = 1.0 - smoothstep(0.74, 1.14, dist);
+      let topFadeEnd = topY + radius.y * 0.22;
+      let bottomFadeStart = bottomY - radius.y * 0.18;
+      let vertical = smoothstep(topY, topFadeEnd, point.y) *
+        (1.0 - smoothstep(bottomFadeStart, bottomY, point.y));
+      return clamp01(ellipse * vertical);
+    }
+
+    fn faceDepthMap(point: vec2f, mask: f32) -> f32 {
+      if (mask <= 0.001) {
+        return 0.0;
+      }
+      let faceCenter = face.p[1].xy;
+      let metricsCenter = face.p[1].zw;
+      let radius = face.p[2].xy;
+      let eyeDistance = face.p[3].x;
+      let leftEye = face.p[4].xy;
+      let rightEye = face.p[4].zw;
+      let nose = face.p[5].xy;
+      let mouth = face.p[5].zw;
+      let chin = face.p[6].xy;
+      let u = clamp((point.x - metricsCenter.x) / max(1.0, radius.x), -1.35, 1.35);
+      let v = clamp((point.y - metricsCenter.y) / max(1.0, radius.y), -1.3, 1.3);
+      let absU = abs(u);
+      let faceVertical = 1.0 - smoothstep(1.02, 1.3, abs(v));
+      let roundness = clamp01(1.0 - absU * 0.86 - abs(v) * 0.24);
+      let centerRidge = (1.0 - smoothstep(0.08, 0.48, absU)) * faceVertical;
+      let eyeDepth = max(
+        faceFeatureMask(point, leftEye, vec2f(max(54.0, eyeDistance * 0.43), max(38.0, eyeDistance * 0.26))),
+        faceFeatureMask(point, rightEye, vec2f(max(54.0, eyeDistance * 0.43), max(38.0, eyeDistance * 0.26))),
+      ) * 0.48;
+      let cheekOffsetX = max(90.0, eyeDistance * 0.54);
+      let cheekY = mix(nose.y, mouth.y, 0.72);
+      let cheekDepth = max(
+        faceFeatureMask(point, vec2f(faceCenter.x - cheekOffsetX, cheekY), vec2f(max(76.0, eyeDistance * 0.52), max(72.0, eyeDistance * 0.45))),
+        faceFeatureMask(point, vec2f(faceCenter.x + cheekOffsetX, cheekY), vec2f(max(76.0, eyeDistance * 0.52), max(72.0, eyeDistance * 0.45))),
+      ) * 0.38;
+      let noseDepth = faceFeatureMask(
+        point,
+        nose,
+        vec2f(max(48.0, eyeDistance * 0.34), max(70.0, eyeDistance * 0.58)),
+      );
+      let mouthDepth = faceFeatureMask(
+        point,
+        mouth,
+        vec2f(max(72.0, eyeDistance * 0.49), max(48.0, eyeDistance * 0.3)),
+      ) * 0.78;
+      let chinDepth = faceFeatureMask(
+        point,
+        chin,
+        vec2f(max(96.0, eyeDistance * 0.62), max(58.0, eyeDistance * 0.38)),
+      ) * 0.66;
+      let shallowContour = (0.08 + 0.2 * roundness) * mask;
+      return clamp01(max(max(max(shallowContour, centerRidge * 0.42), max(eyeDepth, cheekDepth)), max(max(noseDepth, mouthDepth), chinDepth)) * mask);
+    }
+
+    fn deformerWarp(point: vec2f) -> vec2f {
+      let crop = face.p[0].xy;
+      let gx = clamp((point.x / max(1.0, crop.x)) * 4.0, 0.0, 4.0);
+      let gy = clamp((point.y / max(1.0, crop.y)) * 4.0, 0.0, 4.0);
+      let col = min(3u, u32(max(0.0, floor(gx))));
+      let row = min(3u, u32(max(0.0, floor(gy))));
+      let tx = gx - f32(col);
+      let ty = gy - f32(row);
+      let i00 = row * 5u + col;
+      let p00 = faceControlPoints[i00];
+      let p10 = faceControlPoints[i00 + 1u];
+      let p01 = faceControlPoints[i00 + 5u];
+      let p11 = faceControlPoints[i00 + 6u];
+      return lerp2(lerp2(p00, p10, tx), lerp2(p01, p11, tx), ty);
+    }
+
+    fn faceRootDeformerWarp(point: vec2f) -> vec2f {
+      let crop = face.p[0].xy;
+      let gx = clamp((point.x / max(1.0, crop.x)) * 4.0, 0.0, 4.0);
+      let gy = clamp((point.y / max(1.0, crop.y)) * 4.0, 0.0, 4.0);
+      let col = min(3u, u32(max(0.0, floor(gx))));
+      let row = min(3u, u32(max(0.0, floor(gy))));
+      let tx = gx - f32(col);
+      let ty = gy - f32(row);
+      let i00 = row * 5u + col;
+      let p00 = faceRootControlPoints[i00];
+      let p10 = faceRootControlPoints[i00 + 1u];
+      let p01 = faceRootControlPoints[i00 + 5u];
+      let p11 = faceRootControlPoints[i00 + 6u];
+      return lerp2(lerp2(p00, p10, tx), lerp2(p01, p11, tx), ty);
+    }
+
+    fn applyFaceFeatureTurnWarp(source: vec2f, point: vec2f, amount: f32, sign: f32, mask: f32, depth: f32) -> vec2f {
+      let eyeDistance = face.p[3].x;
+      let metricScale = face.p[3].y;
+      let leftEye = face.p[4].xy;
+      let rightEye = face.p[4].zw;
+      let nose = face.p[5].xy;
+      let mouth = face.p[5].zw;
+      let chin = face.p[6].xy;
+      let eyeMid = face.p[6].zw;
+      let mouthMotion = face.p[3].w;
+      let noseMask = faceFeatureMask(source, nose, vec2f(max(30.0, eyeDistance * 0.18), max(36.0, eyeDistance * 0.23))) * mask;
+      let noseBridgeMask = faceFeatureMask(source, vec2f(nose.x, mix(eyeMid.y, nose.y, 0.46)), vec2f(max(36.0, eyeDistance * 0.21), max(56.0, eyeDistance * 0.34))) * mask;
+      let eyeMask = max(
+        faceFeatureMask(source, leftEye, vec2f(max(56.0, eyeDistance * 0.4), max(34.0, eyeDistance * 0.24))),
+        faceFeatureMask(source, rightEye, vec2f(max(56.0, eyeDistance * 0.4), max(34.0, eyeDistance * 0.24))),
+      ) * mask;
+      let mouthMask = faceFeatureMask(source, mouth, vec2f(max(54.0, eyeDistance * 0.38), max(34.0, eyeDistance * 0.22))) * mask;
+      let chinMask = faceFeatureMask(source, chin, vec2f(max(66.0, eyeDistance * 0.46), max(42.0, eyeDistance * 0.28))) * mask;
+      let mouthTurnDampen = 1.0 - clamp01(mouthMotion) * 0.32;
+      var outPoint = point;
+      outPoint.x += sign * amount * metricScale *
+        (noseMask * 60.0 + noseBridgeMask * 10.0 + eyeMask * 2.4 + mouthMask * 7.0 * mouthTurnDampen + chinMask * 6.0);
+      outPoint.y += amount * metricScale * (noseMask * 9.0 + noseBridgeMask * 1.2) +
+        amount * depth * metricScale * (mouthMask * 0.45 + chinMask * 0.65);
+      return outPoint;
+    }
+
+    fn faceTurnWarp(source: vec2f, point: vec2f) -> vec2f {
+      let depthStrength = face.p[7].z;
+      let verticalDepth = face.p[7].w;
+      let yaw = face.p[7].x;
+      let yawAmount = min(1.25, abs(yaw));
+      let amount = yawAmount * depthStrength;
+      let verticalAmount = yawAmount * verticalDepth * (0.55 + depthStrength * 0.45);
+      if (amount <= 0.001 && verticalAmount <= 0.001) {
+        return point;
+      }
+      let sign = select(1.0, -1.0, yaw < 0.0);
+      let metricsCenter = face.p[1].zw;
+      let radius = face.p[2].xy;
+      let eyeDistance = face.p[3].x;
+      let eyeMid = face.p[6].zw;
+      let mouth = face.p[5].zw;
+      let chin = face.p[6].xy;
+      let u = clamp((source.x - metricsCenter.x) / max(1.0, radius.x), -1.35, 1.35);
+      let mask = faceHeadMask(source);
+      if (mask <= 0.001) {
+        return point;
+      }
+      let depth = faceDepthMap(source, mask);
+      let lower = smoothstep(mouth.y - eyeDistance * 0.5, chin.y, source.y) * mask;
+      let upper = (1.0 - smoothstep(eyeMid.y - eyeDistance * 1.05, eyeMid.y - eyeDistance * 0.2, source.y)) * mask;
+      let featureDepthBlend = smoothstep(0.01, 0.15, depthStrength);
+      let localAmount = min(0.46, yawAmount * featureDepthBlend * (0.2 + depthStrength * 0.8));
+      var outPoint = point;
+      outPoint.y += sign * verticalAmount * u * mask * (8.0 + depth * 12.0 + lower * 5.0 - upper * 4.0);
+      return applyFaceFeatureTurnWarp(source, outPoint, localAmount, sign, mask, depth);
+    }
+
+    fn diagonalFaceWarp(source: vec2f, point: vec2f) -> vec2f {
+      if (face.p[8].x <= 0.0) {
+        return point;
+      }
+      let yaw = face.p[7].x;
+      let pitch = face.p[7].y;
+      let depthStrength = face.p[7].z;
+      let yawBlend = smoothstep(0.12, 0.82, abs(yaw));
+      let pitchBlend = smoothstep(0.05, 0.38, abs(pitch));
+      let depthBlend = 0.68 + min(1.0, depthStrength) * 0.28;
+      let amount = yawBlend * pitchBlend * depthBlend;
+      if (amount <= 0.001) {
+        return point;
+      }
+      let mask = faceHeadMask(source);
+      if (mask <= 0.001) {
+        return point;
+      }
+      let sign = select(1.0, -1.0, yaw < 0.0);
+      let metricsCenter = face.p[1].zw;
+      let radius = face.p[2].xy;
+      let eyeDistance = face.p[3].x;
+      let metricScale = face.p[3].y;
+      let leftEye = face.p[4].xy;
+      let rightEye = face.p[4].zw;
+      let mouth = face.p[5].zw;
+      let chin = face.p[6].xy;
+      let eyeMid = face.p[6].zw;
+      let u = clamp((source.x - metricsCenter.x) / max(1.0, radius.x), -1.35, 1.35);
+      let depth = faceDepthMap(source, mask);
+      let sideFromMouth = clamp((source.x - mouth.x) / max(140.0, eyeDistance * 0.94), -1.0, 1.0);
+      let eyeMask = max(
+        faceFeatureMask(source, leftEye, vec2f(max(60.0, eyeDistance * 0.44), max(40.0, eyeDistance * 0.27))),
+        faceFeatureMask(source, rightEye, vec2f(max(60.0, eyeDistance * 0.44), max(40.0, eyeDistance * 0.27))),
+      ) * mask;
+      let mouthMask = faceFeatureMask(source, vec2f(mouth.x, mouth.y + 4.0 * metricScale), vec2f(max(78.0, eyeDistance * 0.54), max(50.0, eyeDistance * 0.33))) * mask;
+      let chinMask = faceFeatureMask(source, vec2f(chin.x, chin.y - 2.0 * metricScale), vec2f(max(100.0, eyeDistance * 0.68), max(66.0, eyeDistance * 0.44))) * mask;
+      let cheekOffsetX = max(88.0, eyeDistance * 0.52);
+      let cheekOffsetY = max(30.0, eyeDistance * 0.18);
+      let cheekMask = max(
+        faceFeatureMask(source, vec2f(mouth.x - cheekOffsetX, mouth.y + cheekOffsetY), vec2f(max(82.0, eyeDistance * 0.54), max(72.0, eyeDistance * 0.48))),
+        faceFeatureMask(source, vec2f(mouth.x + cheekOffsetX, mouth.y + cheekOffsetY), vec2f(max(82.0, eyeDistance * 0.54), max(72.0, eyeDistance * 0.48))),
+      ) * mask;
+      let lowerBand = smoothstep(mouth.y - eyeDistance * 0.1, chin.y + eyeDistance * 0.28, source.y) *
+        (1.0 - smoothstep(chin.y + eyeDistance * 0.3, chin.y + eyeDistance * 0.86, source.y)) *
+        (1.0 - smoothstep(0.86, 1.26, abs((source.x - mouth.x) / max(170.0, eyeDistance * 1.12)))) * mask;
+      let upperBand = (1.0 - smoothstep(eyeMid.y - eyeDistance * 0.68, eyeMid.y + eyeDistance * 0.24, source.y)) * mask;
+      var outPoint = point;
+      if (pitch > 0.0) {
+        let mouthGuard = 1.0 - mouthMask * 0.82;
+        outPoint.y += amount * metricScale * (chinMask * 6.2 + cheekMask * 2.1 + lowerBand * 2.4 * mouthGuard);
+        outPoint.x -= sideFromMouth * amount * metricScale * (chinMask * 1.9 + lowerBand * 0.7 * mouthGuard);
+        outPoint.x += sideFromMouth * amount * metricScale * cheekMask * 0.85;
+        outPoint.y -= amount * metricScale * eyeMask * 1.25;
+        outPoint.y += sign * amount * metricScale * u * lowerBand * 0.85 * mouthGuard;
+      } else {
+        let up = amount * 0.58;
+        outPoint.y -= up * metricScale * (upperBand * (1.8 + depth * 0.8) + eyeMask * 0.4);
+        outPoint.y += up * metricScale * chinMask * 0.7;
+      }
+      return outPoint;
+    }
+
+    fn mouthPuniWarp(source: vec2f, point: vec2f) -> vec2f {
+      let amount = face.p[9].x;
+      if (amount <= 0.001) {
+        return point;
+      }
+      let eyeDistance = face.p[3].x;
+      let metricScale = face.p[3].y;
+      let mouthMotion = face.p[3].w;
+      let mouth = face.p[5].zw;
+      let chin = face.p[6].xy;
+      let cheekOffsetX = max(88.0, eyeDistance * 0.52);
+      let cheekOffsetY = max(30.0, eyeDistance * 0.19);
+      let mouthMask = faceFeatureMask(source, vec2f(mouth.x, mouth.y + 8.0 * metricScale), vec2f(max(82.0, eyeDistance * 0.55), max(52.0, eyeDistance * 0.34)));
+      let chinMask = faceFeatureMask(source, vec2f(chin.x, chin.y - 4.0 * metricScale), vec2f(max(104.0, eyeDistance * 0.7), max(64.0, eyeDistance * 0.43)));
+      let leftCheekMask = faceFeatureMask(source, vec2f(mouth.x - cheekOffsetX, mouth.y + cheekOffsetY), vec2f(max(82.0, eyeDistance * 0.54), max(70.0, eyeDistance * 0.46)));
+      let rightCheekMask = faceFeatureMask(source, vec2f(mouth.x + cheekOffsetX, mouth.y + cheekOffsetY), vec2f(max(82.0, eyeDistance * 0.54), max(70.0, eyeDistance * 0.46)));
+      let cheekMask = max(leftCheekMask, rightCheekMask);
+      let lowerBand = smoothstep(mouth.y - eyeDistance * 0.12, chin.y + eyeDistance * 0.24, source.y) *
+        (1.0 - smoothstep(chin.y + eyeDistance * 0.38, chin.y + eyeDistance * 0.9, source.y)) *
+        (1.0 - smoothstep(0.82, 1.22, abs((source.x - mouth.x) / max(160.0, eyeDistance * 1.06))));
+      let side = clamp((source.x - mouth.x) / max(130.0, eyeDistance * 0.86), -1.0, 1.0);
+      let openStretch = clamp01(mouthMotion);
+      var outPoint = point;
+      outPoint.y += amount * metricScale * (mouthMask * 1.8 + chinMask * 6.2 + cheekMask * 2.0 + lowerBand * 3.8);
+      outPoint.x += side * amount * metricScale * (cheekMask * 2.6 + lowerBand * 1.1);
+      outPoint.y += lowerBand * openStretch * metricScale * 1.6;
+      return outPoint;
+    }
+
+    fn faceWarp(source: vec2f) -> vec2f {
+      let crop = face.p[0].xy;
+      let faceCenter = face.p[1].xy;
+      let metricsCenter = face.p[1].zw;
+      let radius = face.p[2].xy;
+      let voice = face.p[3].z;
+      let nx = (source.x - faceCenter.x) / max(1.0, crop.x * 0.5);
+      let ny = (source.y - faceCenter.y) / max(1.0, crop.y * 0.5);
+      let dome = clamp01(1.0 - abs(nx) * 0.42 - abs(ny) * 0.28);
+      let lowerMask = clamp01((source.y - (metricsCenter.y - radius.y * 0.38)) / max(1.0, radius.y * 0.82));
+      var point = deformerWarp(source);
+      point = faceTurnWarp(source, point);
+      point = diagonalFaceWarp(source, point);
+      point.x += nx * voice * 3.5 * dome;
+      point.y += -abs(nx) * voice * 1.5 * dome + lowerMask * voice * 2.5;
+      return mouthPuniWarp(source, point);
+    }
+
+    fn tearLensWarp(source: vec2f, point: vec2f) -> vec2f {
+      if (face.p[10].x <= 0.0) {
+        return point;
+      }
+      let radius = face.p[10].zw;
+      let leftCenter = face.p[11].xy;
+      let rightCenter = face.p[11].zw;
+      let leftRot = face.p[13];
+      let rightRot = face.p[14];
+      let leftRaw = source - leftCenter;
+      let rightRaw = source - rightCenter;
+      let leftLocal = vec2f(leftRaw.x * leftRot.x - leftRaw.y * leftRot.y, leftRaw.x * leftRot.y + leftRaw.y * leftRot.x);
+      let rightLocal = vec2f(rightRaw.x * rightRot.x - rightRaw.y * rightRot.y, rightRaw.x * rightRot.y + rightRaw.y * rightRot.x);
+      let leftR2 = (leftLocal.x / max(1.0, radius.x)) * (leftLocal.x / max(1.0, radius.x)) +
+        (leftLocal.y / max(1.0, radius.y)) * (leftLocal.y / max(1.0, radius.y));
+      let rightR2 = (rightLocal.x / max(1.0, radius.x)) * (rightLocal.x / max(1.0, radius.x)) +
+        (rightLocal.y / max(1.0, radius.y)) * (rightLocal.y / max(1.0, radius.y));
+      let useLeft = leftR2 <= rightR2;
+      let bestR2 = select(rightR2, leftR2, useLeft);
+      if (bestR2 > 1.0) {
+        return point;
+      }
+      let warpedCenter = select(face.p[12].zw, face.p[12].xy, useLeft);
+      let rot = select(rightRot, leftRot, useLeft);
+      let pulse = select(face.p[15].zw, face.p[15].xy, useLeft);
+      let shimmer = select(face.p[16].y, face.p[16].x, useLeft);
+      let strength = face.p[10].y;
+      let mask = pow(max(0.0, 1.0 - bestR2), 2.2);
+      let sx = 1.0 + strength * mask * (pulse.x * 0.32 + shimmer);
+      let sy = 1.0 + strength * mask * (pulse.y * 0.28 - shimmer * 0.45);
+      let offset = point - warpedCenter;
+      let local = vec2f(offset.x * rot.x - offset.y * rot.y, offset.x * rot.y + offset.y * rot.x);
+      let scaled = vec2f(local.x * sx, local.y * sy);
+      return warpedCenter + vec2f(scaled.x * rot.z - scaled.y * rot.w, scaled.x * rot.w + scaled.y * rot.z);
+    }
+
+    fn faceRigidWarp(source: vec2f) -> vec2f {
+      var point = faceRootDeformerWarp(source);
+      point = faceTurnWarp(source, point);
+      return diagonalFaceWarp(source, point);
+    }
+
+    fn emptyHairSpringSample() -> HairSpringSample {
+      var sample: HairSpringSample;
+      sample.anglePos = 0.0;
+      sample.anglePosY = 0.0;
+      sample.waveX = 0.0;
+      sample.waveY = 0.0;
+      sample.headPosX = 0.0;
+      sample.headPosY = 0.0;
+      sample.headVelX = 0.0;
+      sample.headVelY = 0.0;
+      sample.angleVel = 0.0;
+      sample.angleVelY = 0.0;
+      sample.stretchX = 0.0;
+      sample.stretchY = 0.0;
+      return sample;
+    }
+
+    fn hairSpringSampleAt(baseIndex: u32) -> HairSpringSample {
+      let a = hairSpringSamples[baseIndex];
+      let b = hairSpringSamples[baseIndex + 1u];
+      let c = hairSpringSamples[baseIndex + 2u];
+      var sample: HairSpringSample;
+      sample.anglePos = a.x;
+      sample.anglePosY = a.y;
+      sample.waveX = a.z;
+      sample.waveY = a.w;
+      sample.headPosX = b.x;
+      sample.headPosY = b.y;
+      sample.headVelX = b.z;
+      sample.headVelY = b.w;
+      sample.angleVel = c.x;
+      sample.angleVelY = c.y;
+      sample.stretchX = c.z;
+      sample.stretchY = c.w;
+      return sample;
+    }
+
+    fn hairBundleSampleAt(bundleIndex: u32, bucket: u32) -> HairSpringSample {
+      let baseIndex = (bundleIndex * 5u + bucket) * 3u;
+      let a = hairBundleSamples[baseIndex];
+      let b = hairBundleSamples[baseIndex + 1u];
+      let c = hairBundleSamples[baseIndex + 2u];
+      var sample: HairSpringSample;
+      sample.anglePos = a.x;
+      sample.anglePosY = a.y;
+      sample.waveX = a.z;
+      sample.waveY = a.w;
+      sample.headPosX = b.x;
+      sample.headPosY = b.y;
+      sample.headVelX = b.z;
+      sample.headVelY = b.w;
+      sample.angleVel = c.x;
+      sample.angleVelY = c.y;
+      sample.stretchX = c.z;
+      sample.stretchY = c.w;
+      return sample;
+    }
+
+    fn mixHairSpringSample(a: HairSpringSample, b: HairSpringSample, t: f32) -> HairSpringSample {
+      var sample: HairSpringSample;
+      sample.anglePos = mix(a.anglePos, b.anglePos, t);
+      sample.anglePosY = mix(a.anglePosY, b.anglePosY, t);
+      sample.waveX = mix(a.waveX, b.waveX, t);
+      sample.waveY = mix(a.waveY, b.waveY, t);
+      sample.headPosX = mix(a.headPosX, b.headPosX, t);
+      sample.headPosY = mix(a.headPosY, b.headPosY, t);
+      sample.headVelX = mix(a.headVelX, b.headVelX, t);
+      sample.headVelY = mix(a.headVelY, b.headVelY, t);
+      sample.angleVel = mix(a.angleVel, b.angleVel, t);
+      sample.angleVelY = mix(a.angleVelY, b.angleVelY, t);
+      sample.stretchX = mix(a.stretchX, b.stretchX, t);
+      sample.stretchY = mix(a.stretchY, b.stretchY, t);
+      return sample;
+    }
+
+    fn sampleHairSpring(n: f32) -> HairSpringSample {
+      let nn = clamp(n, 0.0, 1.0) * 4.0;
+      let i0 = min(3u, u32(floor(nn)));
+      let f = nn - f32(i0);
+      return mixHairSpringSample(hairSpringSampleAt(i0 * 3u), hairSpringSampleAt((i0 + 1u) * 3u), f);
+    }
+
+    fn sampleHairBundleSpring(bundleIndex: u32, n: f32) -> HairSpringSample {
+      let nn = clamp(n, 0.0, 1.0) * 4.0;
+      let i0 = min(3u, u32(floor(nn)));
+      let f = nn - f32(i0);
+      return mixHairSpringSample(hairBundleSampleAt(bundleIndex, i0), hairBundleSampleAt(bundleIndex, i0 + 1u), f);
+    }
+
+    fn hairRootTipMotionMask(source: vec2f) -> f32 {
+      let isFront = hair.p[0].z;
+      let metricsCenter = face.p[1].zw;
+      let radius = face.p[2].xy;
+      let topY = face.p[2].z;
+      let rootY = topY + radius.y * mix(0.18, 0.26, isFront);
+      let freeY = metricsCenter.y + radius.y * mix(1.04, 0.68, isFront);
+      let vertical = smoothstep(rootY, freeY, source.y);
+      let sideAmount = smoothstep(radius.x * 0.62, radius.x * 1.25, abs(source.x - metricsCenter.x));
+      let sideUnlockY = smoothstep(topY + radius.y * 0.28, metricsCenter.y + radius.y * 0.62, source.y);
+      let sideUnlock = sideAmount * sideUnlockY * mix(0.18, 0.28, isFront);
+      return clamp(vertical + sideUnlock, 0.0, 1.0);
+    }
+
+    fn hairCrownRootLockMask(source: vec2f) -> f32 {
+      if (hair.p[3].x <= 0.0) {
+        return 0.0;
+      }
+      let metricsCenter = face.p[1].zw;
+      let radius = face.p[2].xy;
+      let topY = face.p[2].z;
+      let u = abs((source.x - metricsCenter.x) / max(1.0, radius.x));
+      let vertical = 1.0 - smoothstep(topY + radius.y * 0.18, topY + radius.y * 0.58, source.y);
+      let center = 1.0 - smoothstep(0.22, 0.92, u);
+      return clamp(vertical * (0.45 + center * 0.55), 0.0, 1.0);
+    }
+
+    fn hairBundleInfluence(source: vec2f, bundleIndex: u32) -> vec4f {
+      let def0 = hairBundleDefs[bundleIndex * 2u];
+      let def1 = hairBundleDefs[bundleIndex * 2u + 1u];
+      if (def1.z <= 0.0) {
+        return vec4f(0.0);
+      }
+      let root = def0.xy;
+      let tip = def0.zw;
+      let v = tip - root;
+      let len2 = dot(v, v);
+      if (len2 < 1.0) {
+        return vec4f(0.0);
+      }
+      let len = sqrt(len2);
+      let t = clamp(dot(source - root, v) / len2, 0.0, 1.0);
+      let closest = root + v * t;
+      let dist = length(source - closest);
+      let width = def1.y * (0.72 + t * 0.38);
+      let distanceWeight = 1.0 - smoothstep(width * 0.42, width, dist);
+      if (distanceWeight <= 0.001) {
+        return vec4f(0.0);
+      }
+      let rootDistance = clamp(length(source - root) / max(1.0, len), 0.0, 1.25);
+      let tipWeight = smoothstep(0.12, 1.02, t * 0.78 + rootDistance * 0.22);
+      let weight = distanceWeight * (0.28 + tipWeight * 0.72);
+      return vec4f(t, tipWeight, weight, 1.0);
+    }
+
+    fn addWeightedHairSpring(total: HairSpringSample, sample: HairSpringSample, weight: f32) -> HairSpringSample {
+      var outSample = total;
+      outSample.anglePos += sample.anglePos * weight;
+      outSample.anglePosY += sample.anglePosY * weight;
+      outSample.waveX += sample.waveX * weight;
+      outSample.waveY += sample.waveY * weight;
+      outSample.headPosX += sample.headPosX * weight;
+      outSample.headPosY += sample.headPosY * weight;
+      outSample.headVelX += sample.headVelX * weight;
+      outSample.headVelY += sample.headVelY * weight;
+      outSample.angleVel += sample.angleVel * weight;
+      outSample.angleVelY += sample.angleVelY * weight;
+      outSample.stretchX += sample.stretchX * weight;
+      outSample.stretchY += sample.stretchY * weight;
+      return outSample;
+    }
+
+    fn scaleHairSpring(sample: HairSpringSample, weight: f32) -> HairSpringSample {
+      var outSample = sample;
+      outSample.anglePos *= weight;
+      outSample.anglePosY *= weight;
+      outSample.waveX *= weight;
+      outSample.waveY *= weight;
+      outSample.headPosX *= weight;
+      outSample.headPosY *= weight;
+      outSample.headVelX *= weight;
+      outSample.headVelY *= weight;
+      outSample.angleVel *= weight;
+      outSample.angleVelY *= weight;
+      outSample.stretchX *= weight;
+      outSample.stretchY *= weight;
+      return outSample;
+    }
+
+    fn blendHairBundleMotion(source: vec2f, baseSpring: HairSpringSample, baseMask: f32) -> HairBundleMotion {
+      var motion: HairBundleMotion;
+      motion.spring = baseSpring;
+      motion.mask = baseMask;
+      motion.motionScale = 1.0;
+      motion.edgeScale = 1.0;
+      let bundleStrength = hair.p[2].w;
+      if (bundleStrength <= 0.001) {
+        return motion;
+      }
+
+      var total = 0.0;
+      var tipTotal = 0.0;
+      var mixSample = emptyHairSpringSample();
+      for (var i = 0u; i < ${HAIR_BUNDLE_DEFS.length}u; i = i + 1u) {
+        let influence = hairBundleInfluence(source, i);
+        if (influence.w <= 0.0) {
+          continue;
+        }
+        let spring = sampleHairBundleSpring(i, influence.y);
+        let weight = influence.z;
+        total += weight;
+        tipTotal += influence.y * weight;
+        mixSample = addWeightedHairSpring(mixSample, spring, weight);
+      }
+
+      if (total <= 0.001) {
+        return motion;
+      }
+
+      let inv = 1.0 / total;
+      mixSample = scaleHairSpring(mixSample, inv);
+      let tipWeight = clamp(tipTotal * inv, 0.0, 1.0);
+      let blend = clamp(clamp(total, 0.0, 1.0) * 0.92 * bundleStrength, 0.0, 1.0);
+      motion.spring = mixHairSpringSample(baseSpring, mixSample, blend);
+      motion.mask = mix(baseMask, tipWeight, blend * 0.88);
+      motion.motionScale = mix(1.0, clamp(tipWeight / max(baseMask, 0.18), 0.28, 1.38), blend);
+      motion.edgeScale = mix(1.0, 0.38 + motion.mask * 0.62, blend);
+      return motion;
+    }
+
+    fn hairWarp(source: vec2f) -> vec2f {
+      let layerIsFront = hair.p[0].z;
+      let hairAmount = hair.p[1].z;
+      let springAmount = hair.p[1].w;
+      let ax = hair.p[1].x;
+      let ay = hair.p[1].y;
+      let faceCenter = face.p[1].xy;
+      let nx = (source.x - faceCenter.x) / max(1.0, face.p[0].x * 0.5);
+      let edge = clamp(abs(nx), 0.0, 1.0);
+      let n = clamp(source.y / max(1.0, face.p[0].y), 0.0, 1.0);
+      let baseMask = hairRootTipMotionMask(source);
+      let baseSpring = sampleHairSpring(n);
+      let bundleMotion = blendHairBundleMotion(source, baseSpring, baseMask);
+      let s = bundleMotion.spring;
+      let activeMask = bundleMotion.mask;
+      let angleLagX = s.anglePos - ax;
+      let angleLagY = s.anglePosY - ay;
+      let tipDelay = activeMask * activeMask * springAmount * clamp(angleLagX * 18.0, -18.0, 18.0);
+      let tipDelayY = activeMask * activeMask * springAmount * clamp(angleLagY * 8.0, -8.0, 8.0);
+      let head = hair.p[2].xy;
+      let shiftX = s.waveX * bundleMotion.motionScale;
+      let shiftY = s.waveY * bundleMotion.motionScale;
+      let lagWeight = activeMask * activeMask * springAmount;
+      let lagX = clamp((s.headPosX - head.x) * lagWeight * 1.6, -30.0, 30.0);
+      let lagY = clamp((s.headPosY - head.y) * lagWeight * 0.85, -18.0, 18.0);
+      let velocityLagX = clamp((-s.headVelX * 0.028 - s.angleVel * 2.4) * lagWeight, -18.0, 18.0);
+      let velocityLagY = clamp(-s.headVelY * 0.018 * lagWeight, -12.0, 12.0);
+      var point = deformerWarp(source);
+      let crownLock = hairCrownRootLockMask(source);
+      if (crownLock > 0.001) {
+        let followAmount = layerIsFront * hair.p[2].z;
+        let root = mix(source, faceRigidWarp(source), followAmount);
+        let lockX = crownLock * mix(0.28, mix(0.28, 0.72, followAmount), layerIsFront);
+        let lockY = crownLock * mix(0.72, mix(0.72, 0.76, followAmount), layerIsFront);
+        point.x = mix(point.x, root.x, lockX);
+        point.y = mix(point.y, root.y, lockY);
+      }
+      let rootMotionDampen = mix(1.0, 1.0 - crownLock * 0.85 * hair.p[2].z, layerIsFront);
+      let sideDirection = mix(-3.0, 2.2, layerIsFront);
+      point.x += shiftX + tipDelay + s.stretchX * bundleMotion.motionScale + lagX + velocityLagX +
+        nx * edge * ax * sideDirection * hairAmount * bundleMotion.edgeScale * rootMotionDampen;
+      point.y += shiftY + s.stretchY * bundleMotion.motionScale + tipDelayY + lagY + velocityLagY;
+      if (hair.p[3].w > 0.0) {
+        let upper = 1.0 - smoothstep(640.0, 980.0, source.y);
+        point.x += hair.p[3].y * (0.55 + upper * 0.45);
+        point.y += hair.p[3].z * (0.6 + upper * 0.4);
+      }
+      return point;
+    }
+
+    fn highlightWarp(source: vec2f) -> vec2f {
+      let shift = hair.p[4].xy;
+      var point = faceWarp(source) + shift;
+      let leftEye = face.p[12].xy + shift;
+      let rightEye = face.p[12].zw + shift;
+      let leftD = dot(point - leftEye, point - leftEye);
+      let rightD = dot(point - rightEye, point - rightEye);
+      let useLeft = leftD <= rightD;
+      let eye = select(rightEye, leftEye, useLeft);
+      let pulse = select(face.p[15].zw, face.p[15].xy, useLeft);
+      point = eye + (point - eye) * (vec2f(1.0, 1.0) + pulse);
+      let film = hair.p[5];
+      let rot = hair.p[6].xy;
+      let slide = hair.p[6].zw;
+      let pivot = eye + hair.p[7].xy;
+      let d = point - pivot;
+      let warped = vec2f(d.x * film.x + d.y * film.z, d.y * film.y + d.x * film.w);
+      return pivot + vec2f(warped.x * rot.x - warped.y * rot.y, warped.x * rot.y + warped.y * rot.x) + slide;
+    }
+
+    fn clipFromLocalPoint(point: vec2f) -> vec4f {
+      let zeroToOne = point / uniforms.resolution;
+      let clip = zeroToOne * 2.0 - 1.0;
+      return vec4f(clip.x, -clip.y, 0.0, 1.0);
+    }
+
+    fn clipFromStagePoint(localPoint: vec2f) -> vec4f {
+      let stagePoint = vec2f(
+        dot(uniforms.stageTransform0.xy, localPoint) + uniforms.stageTransform0.z,
+        dot(uniforms.stageTransform1.xy, localPoint) + uniforms.stageTransform1.z
+      );
+      let zeroToOne = stagePoint / uniforms.stageResolution;
+      let clip = zeroToOne * 2.0 - 1.0;
+      return vec4f(clip.x, -clip.y, 0.0, 1.0);
+    }
+
+    @vertex
+    fn faceVertexMain(@location(0) sourcePosition: vec2f, @location(1) uv: vec2f) -> VertexOut {
+      var out: VertexOut;
+      let warped = tearLensWarp(sourcePosition, faceWarp(sourcePosition));
+      out.position = clipFromLocalPoint(warped);
+      out.uv = uv;
+      return out;
+    }
+
+    @vertex
+    fn highlightVertexMain(@location(0) sourcePosition: vec2f, @location(1) uv: vec2f) -> VertexOut {
+      var out: VertexOut;
+      let warped = highlightWarp(sourcePosition);
+      out.position = clipFromLocalPoint(warped);
+      out.uv = uv;
+      return out;
+    }
+
+    @vertex
+    fn hairVertexMain(@location(0) sourcePosition: vec2f, @location(1) uv: vec2f) -> VertexOut {
+      var out: VertexOut;
+      let warped = hairWarp(sourcePosition);
+      out.position = clipFromLocalPoint(warped);
+      out.uv = uv;
+      return out;
+    }
+
+    @vertex
+    fn faceStageVertexMain(@location(0) sourcePosition: vec2f, @location(1) uv: vec2f) -> VertexOut {
+      var out: VertexOut;
+      let warped = tearLensWarp(sourcePosition, faceWarp(sourcePosition));
+      out.position = clipFromStagePoint(warped);
+      out.uv = uv;
+      return out;
+    }
+
+    @vertex
+    fn highlightStageVertexMain(@location(0) sourcePosition: vec2f, @location(1) uv: vec2f) -> VertexOut {
+      var out: VertexOut;
+      let warped = highlightWarp(sourcePosition);
+      out.position = clipFromStagePoint(warped);
+      out.uv = uv;
+      return out;
+    }
+
+    @vertex
+    fn hairStageVertexMain(@location(0) sourcePosition: vec2f, @location(1) uv: vec2f) -> VertexOut {
+      var out: VertexOut;
+      let warped = hairWarp(sourcePosition);
+      out.position = clipFromStagePoint(warped);
+      out.uv = uv;
+      return out;
+    }
+
+    @fragment
+    fn fragmentMain(input: VertexOut) -> @location(0) vec4f {
+      let sample = textureSample(imageTexture, imageSampler, input.uv);
+      return vec4f(sample.rgb, sample.a * uniforms.stageTransform0.w);
+    }
+
+    @fragment
+    fn tintFragmentMain(input: VertexOut) -> @location(0) vec4f {
+      let sample = textureSample(imageTexture, imageSampler, input.uv);
+      let tint = hair.p[4];
+      return vec4f(tint.rgb, sample.a * tint.a * uniforms.stageTransform0.w);
+    }
+
+    fn hueToRgb(p: f32, q: f32, rawT: f32) -> f32 {
+      var t = rawT;
+      if (t < 0.0) {
+        t += 1.0;
+      }
+      if (t > 1.0) {
+        t -= 1.0;
+      }
+      if (t < 1.0 / 6.0) {
+        return p + (q - p) * 6.0 * t;
+      }
+      if (t < 0.5) {
+        return q;
+      }
+      if (t < 2.0 / 3.0) {
+        return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+      }
+      return p;
+    }
+
+    fn rgbToHsl(color: vec3f) -> vec3f {
+      let maxValue = max(color.r, max(color.g, color.b));
+      let minValue = min(color.r, min(color.g, color.b));
+      let lightness = (maxValue + minValue) * 0.5;
+      let delta = maxValue - minValue;
+      if (delta <= 0.00001) {
+        return vec3f(0.0, 0.0, lightness);
+      }
+      let saturation = delta / (1.0 - abs(2.0 * lightness - 1.0));
+      var hue = 0.0;
+      if (maxValue == color.r) {
+        hue = (color.g - color.b) / delta;
+        if (color.g < color.b) {
+          hue += 6.0;
+        }
+      } else if (maxValue == color.g) {
+        hue = (color.b - color.r) / delta + 2.0;
+      } else {
+        hue = (color.r - color.g) / delta + 4.0;
+      }
+      hue = hue / 6.0;
+      if (hue < 0.0) {
+        hue += 1.0;
+      }
+      return vec3f(hue, saturation, lightness);
+    }
+
+    fn hslToRgb(hsl: vec3f) -> vec3f {
+      if (hsl.y <= 0.00001) {
+        return vec3f(hsl.z);
+      }
+      let q = select(hsl.z + hsl.y - hsl.z * hsl.y, hsl.z * (1.0 + hsl.y), hsl.z < 0.5);
+      let p = 2.0 * hsl.z - q;
+      return vec3f(
+        hueToRgb(p, q, hsl.x + 1.0 / 3.0),
+        hueToRgb(p, q, hsl.x),
+        hueToRgb(p, q, hsl.x - 1.0 / 3.0)
+      );
+    }
+
+    @fragment
+    fn hairTintFragmentMain(input: VertexOut) -> @location(0) vec4f {
+      let sample = textureSample(imageTexture, imageSampler, input.uv);
+      let tint = hair.p[4];
+      let lightnessAmount = clamp(hair.p[5].x, 0.0, 1.0);
+      let sourceLuma = dot(sample.rgb, vec3f(0.2126, 0.7152, 0.0722));
+      var rgb = sample.rgb;
+      if (tint.w > 0.0) {
+        let tintHsl = rgbToHsl(tint.rgb);
+        rgb = hslToRgb(vec3f(tintHsl.x, tintHsl.y, sourceLuma));
+      }
+      if (lightnessAmount > 0.0) {
+        let pastel = mix(tint.rgb, vec3f(1.0), vec3f(0.74));
+        let surfaceMask = smoothstep(0.025, 0.16, sourceLuma);
+        let highlightMask = mix(0.72, 1.0, smoothstep(0.12, 0.72, sourceLuma));
+        let mixAmount = lightnessAmount * surfaceMask * highlightMask * sample.a * 0.86;
+        rgb = mix(rgb, pastel, vec3f(mixAmount));
+      }
+      return vec4f(rgb, sample.a * uniforms.stageTransform0.w);
+    }
+  `;
+  const SHADOW_COMPOSITE_WEBGPU_SHADER = /* wgsl */ `
+    struct FullscreenOut {
+      @builtin(position) position: vec4f,
+      @location(0) uv: vec2f,
+    };
+
+    struct BlurUniforms {
+      step: vec2f,
+      padding: vec2f,
+    };
+
+    @group(0) @binding(0) var shadowSampler: sampler;
+    @group(0) @binding(1) var sourceTexture: texture_2d<f32>;
+    @group(0) @binding(2) var maskTexture: texture_2d<f32>;
+    @group(0) @binding(3) var<uniform> blur: BlurUniforms;
+
+    @vertex
+    fn fullscreenVertexMain(@builtin(vertex_index) vertexIndex: u32) -> FullscreenOut {
+      let positions = array<vec2f, 3>(
+        vec2f(-1.0, -1.0),
+        vec2f(3.0, -1.0),
+        vec2f(-1.0, 3.0)
+      );
+      let position = positions[vertexIndex];
+      var out: FullscreenOut;
+      out.position = vec4f(position, 0.0, 1.0);
+      out.uv = position * vec2f(0.5, -0.5) + vec2f(0.5, 0.5);
+      return out;
+    }
+
+    @fragment
+    fn blurFragmentMain(input: FullscreenOut) -> @location(0) vec4f {
+      let offset1 = blur.step * 1.3846153846;
+      let offset2 = blur.step * 3.2307692308;
+      var color = textureSample(sourceTexture, shadowSampler, input.uv) * 0.2270270270;
+      color += textureSample(sourceTexture, shadowSampler, input.uv + offset1) * 0.3162162162;
+      color += textureSample(sourceTexture, shadowSampler, input.uv - offset1) * 0.3162162162;
+      color += textureSample(sourceTexture, shadowSampler, input.uv + offset2) * 0.0702702703;
+      color += textureSample(sourceTexture, shadowSampler, input.uv - offset2) * 0.0702702703;
+      return color;
+    }
+
+    @fragment
+    fn maskFragmentMain(input: FullscreenOut) -> @location(0) vec4f {
+      let shadow = textureSample(sourceTexture, shadowSampler, input.uv);
+      let maskAlpha = textureSample(maskTexture, shadowSampler, input.uv).a;
+      return vec4f(shadow.rgb * maskAlpha, shadow.a * maskAlpha);
+    }
+  `;
+  const STAGE_ART_WEBGPU_SHADER = /* wgsl */ `
+    struct StageOut {
+      @builtin(position) position: vec4f,
+      @location(0) uv: vec2f,
+    };
+
+    struct StageUniforms {
+      p: array<vec4f, 4>,
+    };
+
+    @group(0) @binding(0) var<uniform> stage: StageUniforms;
+    @group(0) @binding(1) var imageSampler: sampler;
+    @group(0) @binding(2) var imageTexture: texture_2d<f32>;
+
+    @vertex
+    fn fullscreenVertexMain(@builtin(vertex_index) vertexIndex: u32) -> StageOut {
+      let positions = array<vec2f, 3>(
+        vec2f(-1.0, -1.0),
+        vec2f(3.0, -1.0),
+        vec2f(-1.0, 3.0)
+      );
+      let position = positions[vertexIndex];
+      var out: StageOut;
+      out.position = vec4f(position, 0.0, 1.0);
+      out.uv = position * vec2f(0.5, -0.5) + vec2f(0.5, 0.5);
+      return out;
+    }
+
+    @vertex
+    fn quadVertexMain(@builtin(vertex_index) vertexIndex: u32) -> StageOut {
+      let corners = array<vec2f, 6>(
+        stage.p[1].xy,
+        stage.p[1].zw,
+        stage.p[2].xy,
+        stage.p[1].xy,
+        stage.p[2].xy,
+        stage.p[2].zw
+      );
+      let uvRect = stage.p[3];
+      let uvs = array<vec2f, 6>(
+        uvRect.xy,
+        vec2f(uvRect.z, uvRect.y),
+        uvRect.zw,
+        uvRect.xy,
+        uvRect.zw,
+        vec2f(uvRect.x, uvRect.w)
+      );
+      let point = corners[vertexIndex];
+      let zeroToOne = point / stage.p[0].xy;
+      let clip = zeroToOne * 2.0 - 1.0;
+      var out: StageOut;
+      out.position = vec4f(clip.x, -clip.y, 0.0, 1.0);
+      out.uv = uvs[vertexIndex];
+      return out;
+    }
+
+    @fragment
+    fn backgroundFragmentMain(input: StageOut) -> @location(0) vec4f {
+      let point = input.uv * stage.p[0].xy;
+      let distance = length(point - stage.p[3].xy);
+      let mixAmount = smoothstep(0.0, max(1.0, stage.p[3].z), distance);
+      let color = mix(stage.p[2], stage.p[1], mixAmount);
+      return vec4f(color.rgb, 1.0);
+    }
+
+    @fragment
+    fn groundShadowFragmentMain(input: StageOut) -> @location(0) vec4f {
+      let point = input.uv * stage.p[0].xy;
+      let center = stage.p[1].xy;
+      let radius = max(1.0, stage.p[1].z);
+      let delta = vec2f((point.x - center.x) / radius, (point.y - center.y) / (radius * 0.24));
+      let falloff = 1.0 - smoothstep(0.0, 1.0, length(delta));
+      return vec4f(stage.p[2].rgb, stage.p[2].a * falloff);
+    }
+
+    fn highlightDotAlpha(point: vec2f, center: vec2f, radius: vec2f, rot: vec2f) -> f32 {
+      let delta = point - center;
+      let local = vec2f(
+        delta.x * rot.x + delta.y * rot.y,
+        -delta.x * rot.y + delta.y * rot.x
+      ) / max(radius, vec2f(0.001));
+      let glowDistance = length(local - vec2f(-0.16, -0.2));
+      let glowCore = 1.0 - smoothstep(0.02, 0.58, glowDistance);
+      let glowMid = 1.0 - smoothstep(0.58, 0.78, glowDistance);
+      let glowEdge = 1.0 - smoothstep(0.78, 1.38, glowDistance);
+      let glowAlpha = max(max(glowCore, glowMid * 0.96), glowEdge * 0.62);
+      let coreDistance = length(local - vec2f(-0.2, -0.24));
+      let coreAlpha = mix(0.78, 1.0, 1.0 - smoothstep(0.02, 0.92, coreDistance));
+      let coreMask = 1.0 - smoothstep(0.88, 0.92, coreDistance);
+      let core = coreAlpha * coreMask;
+      return clamp(core + glowAlpha * (1.0 - core), 0.0, 1.0);
+    }
+
+    @fragment
+    fn highlightSourceFragmentMain(input: StageOut) -> @location(0) vec4f {
+      let point = input.uv * stage.p[0].xy;
+      let radius0 = stage.p[1].zw;
+      let radius1 = stage.p[2].zw;
+      let alpha0 = highlightDotAlpha(point, stage.p[1].xy, radius0, stage.p[3].xy);
+      let alpha1 = highlightDotAlpha(point, stage.p[2].xy, radius1, stage.p[3].zw);
+      let alpha = (alpha0 + alpha1 * (1.0 - alpha0)) * stage.p[0].z;
+      return vec4f(1.0, 1.0, 1.0, alpha);
+    }
+
+    @fragment
+    fn quadFragmentMain(input: StageOut) -> @location(0) vec4f {
+      let sample = textureSample(imageTexture, imageSampler, input.uv);
+      return vec4f(sample.rgb, sample.a * stage.p[0].z);
+    }
+  `;
+
+  let meshGpuResourcesPromise = null;
+
+  function getMeshGpuResources() {
+    const gpu = navigator.gpu;
+    if (!gpu) return Promise.resolve(null);
+    if (meshGpuResourcesPromise) return meshGpuResourcesPromise;
+
+    const cachedPromise = createMeshGpuResources(gpu, () => {
+      if (meshGpuResourcesPromise === cachedPromise) meshGpuResourcesPromise = null;
+    }).catch(() => {
+      if (meshGpuResourcesPromise === cachedPromise) meshGpuResourcesPromise = null;
+      return null;
+    });
+
+    meshGpuResourcesPromise = cachedPromise;
+    return cachedPromise;
+  }
+
+  async function createMeshGpuResources(gpu, onLost) {
+    const adapter = await gpu.requestAdapter();
+    if (!adapter) return null;
+
+    const device = await adapter.requestDevice();
+    const format = gpu.getPreferredCanvasFormat();
+    const module = device.createShaderModule({ code: MESH_WEBGPU_SHADER });
+    const shadowCompositeModule = device.createShaderModule({
+      code: SHADOW_COMPOSITE_WEBGPU_SHADER,
+    });
+    const stageArtModule = device.createShaderModule({ code: STAGE_ART_WEBGPU_SHADER });
+    const meshVertexBuffers = [
+      {
+        arrayStride: 8,
+        attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }],
+      },
+      {
+        arrayStride: 8,
+        attributes: [{ shaderLocation: 1, offset: 0, format: "float32x2" }],
+      },
+    ];
+    const meshFragmentTargets = [
+      {
+        format,
+        blend: {
+          color: {
+            srcFactor: "src-alpha",
+            dstFactor: "one-minus-src-alpha",
+            operation: "add",
+          },
+          alpha: {
+            srcFactor: "one",
+            dstFactor: "one-minus-src-alpha",
+            operation: "add",
+          },
+        },
+      },
+    ];
+    const createPipeline = (entryPoint, fragmentEntryPoint = "fragmentMain") =>
+      device.createRenderPipeline({
+        layout: "auto",
+        vertex: {
+          module,
+          entryPoint,
+          buffers: meshVertexBuffers,
+        },
+        fragment: {
+          module,
+          entryPoint: fragmentEntryPoint,
+          targets: meshFragmentTargets,
+        },
+        primitive: { topology: "triangle-list" },
+      });
+    const facePipeline = createPipeline("faceVertexMain");
+    const faceStagePipeline = createPipeline("faceStageVertexMain");
+    const highlightPipeline = createPipeline("highlightVertexMain");
+    const highlightStagePipeline = createPipeline("highlightStageVertexMain");
+    const hairPipeline = createPipeline("hairVertexMain");
+    const hairStagePipeline = createPipeline("hairStageVertexMain");
+    const hairTintPipeline = createPipeline("hairVertexMain", "hairTintFragmentMain");
+    const hairTintStagePipeline = createPipeline("hairStageVertexMain", "hairTintFragmentMain");
+    const shadowHairPipeline = createPipeline("hairVertexMain", "tintFragmentMain");
+    const shadowBlurPipeline = device.createRenderPipeline({
+      layout: "auto",
+      vertex: {
+        module: shadowCompositeModule,
+        entryPoint: "fullscreenVertexMain",
+      },
+      fragment: {
+        module: shadowCompositeModule,
+        entryPoint: "blurFragmentMain",
+        targets: [{ format }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+    const shadowMaskPipeline = device.createRenderPipeline({
+      layout: "auto",
+      vertex: {
+        module: shadowCompositeModule,
+        entryPoint: "fullscreenVertexMain",
+      },
+      fragment: {
+        module: shadowCompositeModule,
+        entryPoint: "maskFragmentMain",
+        targets: [{ format }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+    const createStageArtPipeline = (fragmentEntryPoint) =>
+      device.createRenderPipeline({
+        layout: "auto",
+        vertex: {
+          module: stageArtModule,
+          entryPoint:
+            fragmentEntryPoint === "quadFragmentMain" ? "quadVertexMain" : "fullscreenVertexMain",
+        },
+        fragment: {
+          module: stageArtModule,
+          entryPoint: fragmentEntryPoint,
+          targets: meshFragmentTargets,
+        },
+        primitive: { topology: "triangle-list" },
+      });
+    const stageBackgroundPipeline = createStageArtPipeline("backgroundFragmentMain");
+    const stageGroundShadowPipeline = createStageArtPipeline("groundShadowFragmentMain");
+    const stageHighlightSourcePipeline = createStageArtPipeline("highlightSourceFragmentMain");
+    const stageQuadPipeline = createStageArtPipeline("quadFragmentMain");
+    const sampler = device.createSampler({
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge",
+      magFilter: "linear",
+      minFilter: "linear",
+    });
+    const resources = {
+      device,
+      facePipeline,
+      faceStagePipeline,
+      hairPipeline,
+      hairStagePipeline,
+      hairTintPipeline,
+      hairTintStagePipeline,
+      highlightPipeline,
+      highlightStagePipeline,
+      shadowHairPipeline,
+      shadowBlurPipeline,
+      shadowMaskPipeline,
+      stageBackgroundPipeline,
+      stageGroundShadowPipeline,
+      stageHighlightSourcePipeline,
+      stageQuadPipeline,
+      format,
+      lost: false,
+      sampler,
+    };
+
+    void device.lost.then(() => {
+      resources.lost = true;
+      onLost();
+    });
+
+    return resources;
+  }
+
+  async function createWebGpuMeshRenderer(width, height) {
+    const resources = await getMeshGpuResources();
+    if (!resources || resources.lost) return null;
+
+    const meshCanvas = document.createElement("canvas");
+    meshCanvas.width = width;
+    meshCanvas.height = height;
+    const context = meshCanvas.getContext("webgpu");
+    if (!context) return null;
+    const stageContext = stageArtCanvas.getContext("webgpu");
+    if (!stageContext) return null;
+    const {
+      device,
+      facePipeline,
+      faceStagePipeline,
+      format,
+      hairPipeline,
+      hairStagePipeline,
+      hairTintPipeline,
+      hairTintStagePipeline,
+      highlightPipeline,
+      highlightStagePipeline,
+      sampler,
+      shadowBlurPipeline,
+      shadowHairPipeline,
+      shadowMaskPipeline,
+      stageBackgroundPipeline,
+      stageGroundShadowPipeline,
+      stageHighlightSourcePipeline,
+      stageQuadPipeline,
+    } = resources;
+    context.configure({ device, format, alphaMode: "premultiplied" });
+    stageContext.configure({ device, format, alphaMode: "premultiplied" });
+
+    const uniformBuffer = device.createBuffer({
+      size: 48,
+      usage: MESH_GPU_BUFFER_USAGE_UNIFORM | MESH_GPU_BUFFER_USAGE_COPY_DST,
+    });
+    const meshUniformValues = new Float32Array(12);
+    const writeMeshUniforms = (
+      stageWidth = width,
+      stageHeight = height,
+      transform = [1, 0, 0, 0, 1, 0],
+      alpha = 1,
+    ) => {
+      meshUniformValues[0] = width;
+      meshUniformValues[1] = height;
+      meshUniformValues[2] = stageWidth;
+      meshUniformValues[3] = stageHeight;
+      meshUniformValues[4] = transform[0];
+      meshUniformValues[5] = transform[1];
+      meshUniformValues[6] = transform[2];
+      meshUniformValues[7] = alpha;
+      meshUniformValues[8] = transform[3];
+      meshUniformValues[9] = transform[4];
+      meshUniformValues[10] = transform[5];
+      meshUniformValues[11] = 0;
+      device.queue.writeBuffer(uniformBuffer, 0, meshUniformValues);
+    };
+    writeMeshUniforms();
+    const faceUniformBuffer = device.createBuffer({
+      size: MESH_FACE_UNIFORM_VEC4_COUNT * 16,
+      usage: MESH_GPU_BUFFER_USAGE_UNIFORM | MESH_GPU_BUFFER_USAGE_COPY_DST,
+    });
+    const faceControlPointBuffer = device.createBuffer({
+      size: MESH_FACE_CONTROL_POINT_COUNT * 8,
+      usage: MESH_GPU_BUFFER_USAGE_STORAGE | MESH_GPU_BUFFER_USAGE_COPY_DST,
+    });
+    const faceRootControlPointBuffer = device.createBuffer({
+      size: MESH_FACE_CONTROL_POINT_COUNT * 8,
+      usage: MESH_GPU_BUFFER_USAGE_STORAGE | MESH_GPU_BUFFER_USAGE_COPY_DST,
+    });
+    const hairUniformBuffer = device.createBuffer({
+      size: MESH_HAIR_UNIFORM_VEC4_COUNT * 16,
+      usage: MESH_GPU_BUFFER_USAGE_UNIFORM | MESH_GPU_BUFFER_USAGE_COPY_DST,
+    });
+    const hairSpringBuffer = device.createBuffer({
+      size: MESH_HAIR_SPRING_VEC4_COUNT * 16,
+      usage: MESH_GPU_BUFFER_USAGE_STORAGE | MESH_GPU_BUFFER_USAGE_COPY_DST,
+    });
+    const hairBundleDefBuffer = device.createBuffer({
+      size: MESH_HAIR_BUNDLE_DEF_VEC4_COUNT * 16,
+      usage: MESH_GPU_BUFFER_USAGE_STORAGE | MESH_GPU_BUFFER_USAGE_COPY_DST,
+    });
+    const hairBundleSampleBuffer = device.createBuffer({
+      size: MESH_HAIR_BUNDLE_SAMPLE_VEC4_COUNT * 16,
+      usage: MESH_GPU_BUFFER_USAGE_STORAGE | MESH_GPU_BUFFER_USAGE_COPY_DST,
+    });
+    const shadowShapeTexture = device.createTexture({
+      size: [width, height],
+      format,
+      usage: MESH_GPU_TEXTURE_USAGE_TEXTURE_BINDING | MESH_GPU_TEXTURE_USAGE_RENDER_ATTACHMENT,
+    });
+    const shadowBlurTexture = device.createTexture({
+      size: [width, height],
+      format,
+      usage: MESH_GPU_TEXTURE_USAGE_TEXTURE_BINDING | MESH_GPU_TEXTURE_USAGE_RENDER_ATTACHMENT,
+    });
+    const shadowReceiverTexture = device.createTexture({
+      size: [width, height],
+      format,
+      usage: MESH_GPU_TEXTURE_USAGE_TEXTURE_BINDING | MESH_GPU_TEXTURE_USAGE_RENDER_ATTACHMENT,
+    });
+    const shadowCompositeTexture = device.createTexture({
+      size: [width, height],
+      format,
+      usage: MESH_GPU_TEXTURE_USAGE_TEXTURE_BINDING | MESH_GPU_TEXTURE_USAGE_RENDER_ATTACHMENT,
+    });
+    const itemDeformSourceTexture = device.createTexture({
+      size: [width, height],
+      format,
+      usage: MESH_GPU_TEXTURE_USAGE_TEXTURE_BINDING | MESH_GPU_TEXTURE_USAGE_RENDER_ATTACHMENT,
+    });
+    const highlightSourceTexture = device.createTexture({
+      size: [width, height],
+      format,
+      usage: MESH_GPU_TEXTURE_USAGE_TEXTURE_BINDING | MESH_GPU_TEXTURE_USAGE_RENDER_ATTACHMENT,
+    });
+    const shadowShapeView = shadowShapeTexture.createView();
+    const shadowBlurView = shadowBlurTexture.createView();
+    const shadowReceiverView = shadowReceiverTexture.createView();
+    const shadowCompositeView = shadowCompositeTexture.createView();
+    const itemDeformSourceView = itemDeformSourceTexture.createView();
+    const highlightSourceView = highlightSourceTexture.createView();
+    const shadowBlurHorizontalUniformBuffer = device.createBuffer({
+      size: 16,
+      usage: MESH_GPU_BUFFER_USAGE_UNIFORM | MESH_GPU_BUFFER_USAGE_COPY_DST,
+    });
+    const shadowBlurVerticalUniformBuffer = device.createBuffer({
+      size: 16,
+      usage: MESH_GPU_BUFFER_USAGE_UNIFORM | MESH_GPU_BUFFER_USAGE_COPY_DST,
+    });
+    const shadowBlurHorizontalBindGroup = device.createBindGroup({
+      layout: shadowBlurPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: sampler },
+        { binding: 1, resource: shadowShapeView },
+        { binding: 3, resource: { buffer: shadowBlurHorizontalUniformBuffer } },
+      ],
+    });
+    const shadowBlurVerticalBindGroup = device.createBindGroup({
+      layout: shadowBlurPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: sampler },
+        { binding: 1, resource: shadowBlurView },
+        { binding: 3, resource: { buffer: shadowBlurVerticalUniformBuffer } },
+      ],
+    });
+    const stageUniformBuffer = device.createBuffer({
+      size: 64,
+      usage: MESH_GPU_BUFFER_USAGE_UNIFORM | MESH_GPU_BUFFER_USAGE_COPY_DST,
+    });
+    const stageUniformValues = new Float32Array(16);
+    const stageBackgroundBindGroup = device.createBindGroup({
+      layout: stageBackgroundPipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: stageUniformBuffer } }],
+    });
+    const stageGroundShadowBindGroup = device.createBindGroup({
+      layout: stageGroundShadowPipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: stageUniformBuffer } }],
+    });
+    const stageHighlightSourceBindGroup = device.createBindGroup({
+      layout: stageHighlightSourcePipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: stageUniformBuffer } }],
+    });
+    const shadowCompositeStageQuadBindGroup = device.createBindGroup({
+      layout: stageQuadPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: stageUniformBuffer } },
+        { binding: 1, resource: sampler },
+        { binding: 2, resource: shadowCompositeView },
+      ],
+    });
+    const highlightSourceEntry = {
+      height,
+      highlightStageBindGroup: device.createBindGroup({
+        layout: highlightStagePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuffer } },
+          { binding: 1, resource: sampler },
+          { binding: 2, resource: highlightSourceView },
+          { binding: 3, resource: { buffer: faceUniformBuffer } },
+          { binding: 4, resource: { buffer: faceControlPointBuffer } },
+          { binding: 6, resource: { buffer: hairUniformBuffer } },
+        ],
+      }),
+      view: highlightSourceView,
+      width,
+    };
+    const itemDeformSourceEntry = {
+      faceBindGroup: device.createBindGroup({
+        layout: facePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuffer } },
+          { binding: 1, resource: sampler },
+          { binding: 2, resource: itemDeformSourceView },
+          { binding: 3, resource: { buffer: faceUniformBuffer } },
+          { binding: 4, resource: { buffer: faceControlPointBuffer } },
+        ],
+      }),
+      faceStageBindGroup: device.createBindGroup({
+        layout: faceStagePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuffer } },
+          { binding: 1, resource: sampler },
+          { binding: 2, resource: itemDeformSourceView },
+          { binding: 3, resource: { buffer: faceUniformBuffer } },
+          { binding: 4, resource: { buffer: faceControlPointBuffer } },
+        ],
+      }),
+      hairBindGroup: device.createBindGroup({
+        layout: hairPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuffer } },
+          { binding: 1, resource: sampler },
+          { binding: 2, resource: itemDeformSourceView },
+          { binding: 3, resource: { buffer: faceUniformBuffer } },
+          { binding: 4, resource: { buffer: faceControlPointBuffer } },
+          { binding: 5, resource: { buffer: faceRootControlPointBuffer } },
+          { binding: 6, resource: { buffer: hairUniformBuffer } },
+          { binding: 7, resource: { buffer: hairSpringBuffer } },
+          { binding: 8, resource: { buffer: hairBundleDefBuffer } },
+          { binding: 9, resource: { buffer: hairBundleSampleBuffer } },
+        ],
+      }),
+      hairStageBindGroup: device.createBindGroup({
+        layout: hairStagePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuffer } },
+          { binding: 1, resource: sampler },
+          { binding: 2, resource: itemDeformSourceView },
+          { binding: 3, resource: { buffer: faceUniformBuffer } },
+          { binding: 4, resource: { buffer: faceControlPointBuffer } },
+          { binding: 5, resource: { buffer: faceRootControlPointBuffer } },
+          { binding: 6, resource: { buffer: hairUniformBuffer } },
+          { binding: 7, resource: { buffer: hairSpringBuffer } },
+          { binding: 8, resource: { buffer: hairBundleDefBuffer } },
+          { binding: 9, resource: { buffer: hairBundleSampleBuffer } },
+        ],
+      }),
+      height,
+      view: itemDeformSourceView,
+      width,
+    };
+    let stageWidth = Math.max(1, window.innerWidth || 1);
+    let stageHeight = Math.max(1, window.innerHeight || 1);
+    let stageDpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+
+    const textures = new Map();
+    const textureSet = new Set();
+    const geometryCache = new Map();
+    let disposed = false;
+
+    function currentTextureView() {
+      try {
+        return context.getCurrentTexture().createView();
+      } catch (error) {
+        if (!(error instanceof DOMException) || error.name !== "InvalidStateError") throw error;
+        context.configure({ device, format, alphaMode: "premultiplied" });
+        return context.getCurrentTexture().createView();
+      }
+    }
+
+    function configureStageContext() {
+      stageContext.configure({ device, format, alphaMode: "premultiplied" });
+    }
+
+    function stageCurrentTextureView() {
+      try {
+        return stageContext.getCurrentTexture().createView();
+      } catch (error) {
+        if (!(error instanceof DOMException) || error.name !== "InvalidStateError") throw error;
+        configureStageContext();
+        return stageContext.getCurrentTexture().createView();
+      }
+    }
+
+    function destroyTextureEntry(entry) {
+      if (!entry?.texture) return;
+      textureSet.delete(entry.texture);
+      entry.texture.destroy();
+    }
+
+    function rememberTextureEntry(image, entry) {
+      textures.delete(image);
+      textures.set(image, entry);
+      while (textures.size > MESH_TEXTURE_CACHE_LIMIT) {
+        const oldest = textures.entries().next().value;
+        if (!oldest) break;
+        const [oldImage, oldEntry] = oldest;
+        textures.delete(oldImage);
+        destroyTextureEntry(oldEntry);
+      }
+    }
+
+    function meshGeometry(cols, rows, imgW, imgH) {
+      const cacheKey = `${cols}x${rows}@${imgW}x${imgH}`;
+      const cached = geometryCache.get(cacheKey);
+      if (cached) return cached;
+
+      const pointCount = (cols + 1) * (rows + 1);
+      const vertexCount = cols * rows * 6;
+      const gridX = new Float32Array(pointCount);
+      const gridY = new Float32Array(pointCount);
+      const sourcePositions = new Float32Array(vertexCount * 2);
+      const texcoords = new Float32Array(vertexCount * 2);
+
+      for (let y = 0; y <= rows; y += 1) {
+        for (let x = 0; x <= cols; x += 1) {
+          const idx = y * (cols + 1) + x;
+          gridX[idx] = (x / cols) * CROP.w;
+          gridY[idx] = (y / rows) * CROP.h;
+        }
+      }
+
+      let vertex = 0;
+      const pushIndex = (idx) => {
+        sourcePositions[vertex * 2] = gridX[idx];
+        sourcePositions[vertex * 2 + 1] = gridY[idx];
+        texcoords[vertex * 2] = (CROP.x + gridX[idx]) / imgW;
+        texcoords[vertex * 2 + 1] = (CROP.y + gridY[idx]) / imgH;
+        vertex += 1;
+      };
+
+      for (let y = 0; y < rows; y += 1) {
+        for (let x = 0; x < cols; x += 1) {
+          const i00 = y * (cols + 1) + x;
+          const i10 = i00 + 1;
+          const i01 = i00 + cols + 1;
+          const i11 = i01 + 1;
+          pushIndex(i00);
+          pushIndex(i10);
+          pushIndex(i11);
+          pushIndex(i00);
+          pushIndex(i11);
+          pushIndex(i01);
+        }
+      }
+
+      const sourcePositionBuffer = device.createBuffer({
+        size: sourcePositions.byteLength,
+        usage: MESH_GPU_BUFFER_USAGE_VERTEX | MESH_GPU_BUFFER_USAGE_COPY_DST,
+      });
+      const texcoordBuffer = device.createBuffer({
+        size: texcoords.byteLength,
+        usage: MESH_GPU_BUFFER_USAGE_VERTEX | MESH_GPU_BUFFER_USAGE_COPY_DST,
+      });
+      device.queue.writeBuffer(sourcePositionBuffer, 0, sourcePositions);
+      device.queue.writeBuffer(texcoordBuffer, 0, texcoords);
+
+      const geometry = {
+        sourcePositionBuffer,
+        texcoordBuffer,
+        vertexCount,
+      };
+      geometryCache.set(cacheKey, geometry);
+      return geometry;
+    }
+
+    function textureFor(image) {
+      const cached = textures.get(image);
+      const version = Number(image?.__purupuruTextureVersion) || 0;
+      const imgW = image.naturalWidth || image.width;
+      const imgH = image.naturalHeight || image.height;
+      if (imgW <= 0 || imgH <= 0) throw new Error("WebGPU texture source has no size");
+      if (cached && cached.version === version && cached.width === imgW && cached.height === imgH)
+        return cached;
+
+      let entry = cached;
+      if (entry && (entry.width !== imgW || entry.height !== imgH)) {
+        textures.delete(image);
+        destroyTextureEntry(entry);
+        entry = null;
+      }
+      if (!entry) {
+        const texture = device.createTexture({
+          size: [imgW, imgH],
+          format: "rgba8unorm",
+          usage:
+            MESH_GPU_TEXTURE_USAGE_TEXTURE_BINDING |
+            MESH_GPU_TEXTURE_USAGE_COPY_DST |
+            MESH_GPU_TEXTURE_USAGE_RENDER_ATTACHMENT,
+        });
+        textureSet.add(texture);
+        const view = texture.createView();
+        entry = {
+            faceBindGroup: device.createBindGroup({
+              layout: facePipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: { buffer: uniformBuffer } },
+                { binding: 1, resource: sampler },
+                { binding: 2, resource: view },
+                { binding: 3, resource: { buffer: faceUniformBuffer } },
+                { binding: 4, resource: { buffer: faceControlPointBuffer } },
+              ],
+            }),
+            faceStageBindGroup: device.createBindGroup({
+              layout: faceStagePipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: { buffer: uniformBuffer } },
+                { binding: 1, resource: sampler },
+                { binding: 2, resource: view },
+                { binding: 3, resource: { buffer: faceUniformBuffer } },
+                { binding: 4, resource: { buffer: faceControlPointBuffer } },
+              ],
+            }),
+            hairBindGroup: device.createBindGroup({
+              layout: hairPipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: { buffer: uniformBuffer } },
+                { binding: 1, resource: sampler },
+                { binding: 2, resource: view },
+                { binding: 3, resource: { buffer: faceUniformBuffer } },
+                { binding: 4, resource: { buffer: faceControlPointBuffer } },
+                { binding: 5, resource: { buffer: faceRootControlPointBuffer } },
+                { binding: 6, resource: { buffer: hairUniformBuffer } },
+                { binding: 7, resource: { buffer: hairSpringBuffer } },
+                { binding: 8, resource: { buffer: hairBundleDefBuffer } },
+                { binding: 9, resource: { buffer: hairBundleSampleBuffer } },
+              ],
+            }),
+            hairStageBindGroup: device.createBindGroup({
+              layout: hairStagePipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: { buffer: uniformBuffer } },
+                { binding: 1, resource: sampler },
+                { binding: 2, resource: view },
+                { binding: 3, resource: { buffer: faceUniformBuffer } },
+                { binding: 4, resource: { buffer: faceControlPointBuffer } },
+                { binding: 5, resource: { buffer: faceRootControlPointBuffer } },
+                { binding: 6, resource: { buffer: hairUniformBuffer } },
+                { binding: 7, resource: { buffer: hairSpringBuffer } },
+                { binding: 8, resource: { buffer: hairBundleDefBuffer } },
+                { binding: 9, resource: { buffer: hairBundleSampleBuffer } },
+              ],
+            }),
+            hairTintBindGroup: device.createBindGroup({
+              layout: hairTintPipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: { buffer: uniformBuffer } },
+                { binding: 1, resource: sampler },
+                { binding: 2, resource: view },
+                { binding: 3, resource: { buffer: faceUniformBuffer } },
+                { binding: 4, resource: { buffer: faceControlPointBuffer } },
+                { binding: 5, resource: { buffer: faceRootControlPointBuffer } },
+                { binding: 6, resource: { buffer: hairUniformBuffer } },
+                { binding: 7, resource: { buffer: hairSpringBuffer } },
+                { binding: 8, resource: { buffer: hairBundleDefBuffer } },
+                { binding: 9, resource: { buffer: hairBundleSampleBuffer } },
+              ],
+            }),
+            hairTintStageBindGroup: device.createBindGroup({
+              layout: hairTintStagePipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: { buffer: uniformBuffer } },
+                { binding: 1, resource: sampler },
+                { binding: 2, resource: view },
+                { binding: 3, resource: { buffer: faceUniformBuffer } },
+                { binding: 4, resource: { buffer: faceControlPointBuffer } },
+                { binding: 5, resource: { buffer: faceRootControlPointBuffer } },
+                { binding: 6, resource: { buffer: hairUniformBuffer } },
+                { binding: 7, resource: { buffer: hairSpringBuffer } },
+                { binding: 8, resource: { buffer: hairBundleDefBuffer } },
+                { binding: 9, resource: { buffer: hairBundleSampleBuffer } },
+              ],
+            }),
+            shadowHairBindGroup: device.createBindGroup({
+              layout: shadowHairPipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: { buffer: uniformBuffer } },
+                { binding: 1, resource: sampler },
+                { binding: 2, resource: view },
+                { binding: 3, resource: { buffer: faceUniformBuffer } },
+                { binding: 4, resource: { buffer: faceControlPointBuffer } },
+                { binding: 5, resource: { buffer: faceRootControlPointBuffer } },
+                { binding: 6, resource: { buffer: hairUniformBuffer } },
+                { binding: 7, resource: { buffer: hairSpringBuffer } },
+                { binding: 8, resource: { buffer: hairBundleDefBuffer } },
+                { binding: 9, resource: { buffer: hairBundleSampleBuffer } },
+              ],
+            }),
+            highlightBindGroup: device.createBindGroup({
+              layout: highlightPipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: { buffer: uniformBuffer } },
+                { binding: 1, resource: sampler },
+                { binding: 2, resource: view },
+                { binding: 3, resource: { buffer: faceUniformBuffer } },
+                { binding: 4, resource: { buffer: faceControlPointBuffer } },
+                { binding: 6, resource: { buffer: hairUniformBuffer } },
+              ],
+            }),
+            highlightStageBindGroup: device.createBindGroup({
+              layout: highlightStagePipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: { buffer: uniformBuffer } },
+                { binding: 1, resource: sampler },
+                { binding: 2, resource: view },
+                { binding: 3, resource: { buffer: faceUniformBuffer } },
+                { binding: 4, resource: { buffer: faceControlPointBuffer } },
+                { binding: 6, resource: { buffer: hairUniformBuffer } },
+              ],
+            }),
+            stageQuadBindGroup: device.createBindGroup({
+              layout: stageQuadPipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: { buffer: stageUniformBuffer } },
+                { binding: 1, resource: sampler },
+                { binding: 2, resource: view },
+              ],
+            }),
+            height: imgH,
+            texture,
+            version,
+            view,
+            width: imgW,
+        };
+      }
+      device.queue.copyExternalImageToTexture(
+        { source: image },
+        { texture: entry.texture },
+        { width: imgW, height: imgH },
+      );
+      entry.version = version;
+      rememberTextureEntry(image, entry);
+      return entry;
+    }
+
+    function encodeGpuPipeline(
+      encoder,
+      geometry,
+      pipelineToUse,
+      bindGroup,
+      targetView,
+      loadOp = "clear",
+    ) {
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: targetView,
+            loadOp,
+            storeOp: "store",
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          },
+        ],
+      });
+      pass.setPipeline(pipelineToUse);
+      pass.setBindGroup(0, bindGroup);
+      pass.setVertexBuffer(0, geometry.sourcePositionBuffer);
+      pass.setVertexBuffer(1, geometry.texcoordBuffer);
+      pass.draw(geometry.vertexCount);
+      pass.end();
+    }
+
+    function drawGpuPipeline(
+      geometry,
+      pipelineToUse,
+      bindGroup,
+      targetView = null,
+      loadOp = "clear",
+    ) {
+      const encoder = device.createCommandEncoder();
+      encodeGpuPipeline(
+        encoder,
+        geometry,
+        pipelineToUse,
+        bindGroup,
+        targetView || currentTextureView(),
+        loadOp,
+      );
+      device.queue.submit([encoder.finish()]);
+      return true;
+    }
+
+    function writeFaceWarpBuffers(gpuWarpSpec) {
+      device.queue.writeBuffer(faceUniformBuffer, 0, gpuWarpSpec.uniforms);
+      device.queue.writeBuffer(faceControlPointBuffer, 0, gpuWarpSpec.controlPoints);
+      if (gpuWarpSpec.faceRootControlPoints) {
+        device.queue.writeBuffer(faceRootControlPointBuffer, 0, gpuWarpSpec.faceRootControlPoints);
+      }
+    }
+
+    function drawGpuWarpTextureEntry(
+      textureEntry,
+      geometry,
+      gpuWarpSpec,
+      targetView = null,
+      stageDraw = false,
+      loadOp = stageDraw ? "load" : "clear",
+    ) {
+      if (!gpuWarpSpec?.kind) return false;
+      const hasFaceBuffers =
+        gpuWarpSpec.uniforms?.length === MESH_FACE_UNIFORM_VEC4_COUNT * 4 &&
+        gpuWarpSpec.controlPoints?.length === MESH_FACE_CONTROL_POINT_COUNT * 2;
+      if (!hasFaceBuffers) return false;
+
+      if (gpuWarpSpec.kind === "face-v1") {
+        writeFaceWarpBuffers(gpuWarpSpec);
+        return drawGpuPipeline(
+          geometry,
+          stageDraw ? faceStagePipeline : facePipeline,
+          stageDraw ? textureEntry.faceStageBindGroup : textureEntry.faceBindGroup,
+          targetView,
+          loadOp,
+        );
+      }
+
+      if (
+        gpuWarpSpec.kind === "highlight-v1" &&
+        gpuWarpSpec.hairUniforms?.length === MESH_HAIR_UNIFORM_VEC4_COUNT * 4
+      ) {
+        writeFaceWarpBuffers(gpuWarpSpec);
+        device.queue.writeBuffer(hairUniformBuffer, 0, gpuWarpSpec.hairUniforms);
+        return drawGpuPipeline(
+          geometry,
+          stageDraw ? highlightStagePipeline : highlightPipeline,
+          stageDraw ? textureEntry.highlightStageBindGroup : textureEntry.highlightBindGroup,
+          targetView,
+          loadOp,
+        );
+      }
+
+      if (
+        (gpuWarpSpec.kind === "hair-v1" || gpuWarpSpec.kind === "hair-shadow-v1") &&
+        gpuWarpSpec.faceRootControlPoints?.length === MESH_FACE_CONTROL_POINT_COUNT * 2 &&
+        gpuWarpSpec.hairUniforms?.length === MESH_HAIR_UNIFORM_VEC4_COUNT * 4 &&
+        gpuWarpSpec.hairSpringSamples?.length === MESH_HAIR_SPRING_VEC4_COUNT * 4 &&
+        gpuWarpSpec.hairBundleDefs?.length === MESH_HAIR_BUNDLE_DEF_VEC4_COUNT * 4 &&
+        gpuWarpSpec.hairBundleSamples?.length === MESH_HAIR_BUNDLE_SAMPLE_VEC4_COUNT * 4
+      ) {
+        const isShadowHair = gpuWarpSpec.kind === "hair-shadow-v1";
+        const isTintedHair =
+          !isShadowHair &&
+          gpuWarpSpec.hairTintEnabled &&
+          Boolean(stageDraw ? textureEntry.hairTintStageBindGroup : textureEntry.hairTintBindGroup);
+        writeFaceWarpBuffers(gpuWarpSpec);
+        device.queue.writeBuffer(hairUniformBuffer, 0, gpuWarpSpec.hairUniforms);
+        device.queue.writeBuffer(hairSpringBuffer, 0, gpuWarpSpec.hairSpringSamples);
+        device.queue.writeBuffer(hairBundleDefBuffer, 0, gpuWarpSpec.hairBundleDefs);
+        device.queue.writeBuffer(hairBundleSampleBuffer, 0, gpuWarpSpec.hairBundleSamples);
+        return drawGpuPipeline(
+          geometry,
+          stageDraw
+            ? isTintedHair
+              ? hairTintStagePipeline
+              : hairStagePipeline
+            : isShadowHair
+              ? shadowHairPipeline
+              : isTintedHair
+                ? hairTintPipeline
+                : hairPipeline,
+          stageDraw
+            ? isTintedHair
+              ? textureEntry.hairTintStageBindGroup
+              : textureEntry.hairStageBindGroup
+            : isShadowHair
+              ? textureEntry.shadowHairBindGroup
+              : isTintedHair
+                ? textureEntry.hairTintBindGroup
+                : textureEntry.hairBindGroup,
+          targetView,
+          loadOp,
+        );
+      }
+
+      return false;
+    }
+
+    function drawGpuWarp(
+      image,
+      geometry,
+      gpuWarpSpec,
+      targetView = null,
+      stageDraw = false,
+      loadOp = stageDraw ? "load" : "clear",
+    ) {
+      return drawGpuWarpTextureEntry(
+        textureFor(image),
+        geometry,
+        gpuWarpSpec,
+        targetView,
+        stageDraw,
+        loadOp,
+      );
+    }
+
+    function encodeFullscreenPass(
+      encoder,
+      pipelineToUse,
+      bindGroup,
+      targetView,
+      loadOp = "clear",
+      vertexCount = 3,
+    ) {
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: targetView,
+            loadOp,
+            storeOp: "store",
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          },
+        ],
+      });
+      pass.setPipeline(pipelineToUse);
+      pass.setBindGroup(0, bindGroup);
+      pass.draw(vertexCount);
+      pass.end();
+    }
+
+    function rgbaFromHex(color, fallback = "#F2F5FA", alpha = 1) {
+      const normalized = normalizeHexColorValue(color, fallback);
+      return [
+        parseInt(normalized.slice(1, 3), 16) / 255,
+        parseInt(normalized.slice(3, 5), 16) / 255,
+        parseInt(normalized.slice(5, 7), 16) / 255,
+        alpha,
+      ];
+    }
+
+    function writeStageUniform(values) {
+      stageUniformValues.fill(0);
+      stageUniformValues.set(values.slice(0, stageUniformValues.length));
+      device.queue.writeBuffer(stageUniformBuffer, 0, stageUniformValues);
+    }
+
+    function drawStageFullscreenPipeline(
+      pipelineToUse,
+      bindGroup,
+      loadOp = "load",
+      vertexCount = 3,
+    ) {
+      const encoder = device.createCommandEncoder();
+      encodeFullscreenPass(
+        encoder,
+        pipelineToUse,
+        bindGroup,
+        stageCurrentTextureView(),
+        loadOp,
+        vertexCount,
+      );
+      device.queue.submit([encoder.finish()]);
+    }
+
+    function stageTransformValues(transform) {
+      const cos = Math.cos(transform.rotation);
+      const sin = Math.sin(transform.rotation);
+      return [
+        cos * transform.scaleX,
+        -sin * transform.scaleY,
+        transform.anchorX -
+          cos * transform.scaleX * transform.pivotX +
+          sin * transform.scaleY * transform.pivotY,
+        sin * transform.scaleX,
+        cos * transform.scaleY,
+        transform.anchorY -
+          sin * transform.scaleX * transform.pivotX -
+          cos * transform.scaleY * transform.pivotY,
+      ];
+    }
+
+    function resizeStage(nextWidth, nextHeight, nextDpr) {
+      const cssWidth = Math.max(1, Number(nextWidth) || 1);
+      const cssHeight = Math.max(1, Number(nextHeight) || 1);
+      const dpr = Math.max(1, Math.min(2, Number(nextDpr) || 1));
+      const pixelWidth = Math.round(cssWidth * dpr);
+      const pixelHeight = Math.round(cssHeight * dpr);
+      const changed =
+        stageArtCanvas.width !== pixelWidth ||
+        stageArtCanvas.height !== pixelHeight ||
+        stageWidth !== cssWidth ||
+        stageHeight !== cssHeight ||
+        stageDpr !== dpr;
+      stageWidth = cssWidth;
+      stageHeight = cssHeight;
+      stageDpr = dpr;
+      if (!changed) return;
+      stageArtCanvas.width = pixelWidth;
+      stageArtCanvas.height = pixelHeight;
+      configureStageContext();
+    }
+
+    function clearStageFrame() {
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: stageCurrentTextureView(),
+            loadOp: "clear",
+            storeOp: "store",
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          },
+        ],
+      });
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+    }
+
+    function beginStageFrame({ bgColor, transparent = false }) {
+      if (transparent) {
+        clearStageFrame();
+        return;
+      }
+      const dark = bgColor === "#2B2926";
+      const base = rgbaFromHex(bgColor, "#F2F5FA", 1);
+      const glow = dark
+        ? rgbaFromHex("#F4F7FB", "#F4F7FB", 0.1)
+        : rgbaFromHex("#FFFFFF", "#FFFFFF", 0.18);
+      const glowColor = [
+        lerp(base[0], glow[0], glow[3]),
+        lerp(base[1], glow[1], glow[3]),
+        lerp(base[2], glow[2], glow[3]),
+        1,
+      ];
+      writeStageUniform([
+        stageWidth,
+        stageHeight,
+        0,
+        0,
+        base[0],
+        base[1],
+        base[2],
+        base[3],
+        glowColor[0],
+        glowColor[1],
+        glowColor[2],
+        glowColor[3],
+        stageWidth * 0.45,
+        stageHeight * 0.42,
+        stageHeight * 0.58,
+        0,
+      ]);
+      drawStageFullscreenPipeline(
+        stageBackgroundPipeline,
+        stageBackgroundBindGroup,
+        "clear",
+      );
+    }
+
+    function drawStageGroundShadow(cx, cy, rx, voice) {
+      writeStageUniform([
+        stageWidth,
+        stageHeight,
+        0,
+        0,
+        cx,
+        cy,
+        rx,
+        0,
+        31 / 255,
+        36 / 255,
+        48 / 255,
+        0.18 + voice * 0.05,
+      ]);
+      drawStageFullscreenPipeline(
+        stageGroundShadowPipeline,
+        stageGroundShadowBindGroup,
+      );
+    }
+
+    function drawTextureQuadToTarget(
+      bindGroup,
+      corners,
+      {
+        alpha = 1,
+        height: targetHeight = stageHeight,
+        loadOp = "load",
+        targetView = stageCurrentTextureView(),
+        width: targetWidth = stageWidth,
+      } = {},
+    ) {
+      if (!bindGroup || !corners?.every(Boolean)) return;
+      writeStageUniform([
+        targetWidth,
+        targetHeight,
+        clamp(alpha, 0, 1),
+        0,
+        corners[0].x,
+        corners[0].y,
+        corners[1].x,
+        corners[1].y,
+        corners[2].x,
+        corners[2].y,
+        corners[3].x,
+        corners[3].y,
+        0,
+        0,
+        1,
+        1,
+      ]);
+      const encoder = device.createCommandEncoder();
+      encodeFullscreenPass(encoder, stageQuadPipeline, bindGroup, targetView, loadOp, 6);
+      device.queue.submit([encoder.finish()]);
+    }
+
+    function drawQuadToTarget(image, corners, options = {}) {
+      if (!image) return;
+      drawTextureQuadToTarget(textureFor(image).stageQuadBindGroup, corners, options);
+    }
+
+    function drawStageQuad(image, corners, { alpha = 1 } = {}) {
+      drawQuadToTarget(image, corners, { alpha });
+    }
+
+    function drawFrontHairShadowToStage(corners, { alpha = 1 } = {}) {
+      drawTextureQuadToTarget(shadowCompositeStageQuadBindGroup, corners, {
+        alpha,
+      });
+    }
+
+    function drawStageWarpedImage(image, cols, rows, options = {}) {
+      if (!image || !options.characterTransform) return false;
+      const gpuWarpSpec = options.gpuWarpSpec || null;
+      const imgW = image.naturalWidth || image.width;
+      const imgH = image.naturalHeight || image.height;
+      const geometry = meshGeometry(cols, rows, imgW, imgH);
+      writeMeshUniforms(
+        stageWidth,
+        stageHeight,
+        stageTransformValues(options.characterTransform),
+        clamp(options.alpha ?? 1, 0, 1),
+      );
+      return drawGpuWarp(image, geometry, gpuWarpSpec, stageCurrentTextureView(), true);
+    }
+
+    function clearItemDeformSource() {
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: itemDeformSourceView,
+            loadOp: "clear",
+            storeOp: "store",
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          },
+        ],
+      });
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+    }
+
+    function drawItemDeformSource(image, corners, { alpha = 1 } = {}) {
+      clearItemDeformSource();
+      drawQuadToTarget(image, corners, {
+        alpha,
+        height,
+        targetView: itemDeformSourceView,
+        width,
+      });
+    }
+
+    function drawItemDeformSourceWarpedToStage(cols, rows, options = {}) {
+      if (!options.characterTransform) return false;
+      const geometry = meshGeometry(cols, rows, width, height);
+      writeMeshUniforms(
+        stageWidth,
+        stageHeight,
+        stageTransformValues(options.characterTransform),
+        clamp(options.alpha ?? 1, 0, 1),
+      );
+      return drawGpuWarpTextureEntry(
+        itemDeformSourceEntry,
+        geometry,
+        options.gpuWarpSpec || null,
+        stageCurrentTextureView(),
+        true,
+        "load",
+      );
+    }
+
+    function drawItemDeformSourceWarpedToShadowReceiver(cols, rows, options = {}) {
+      const geometry = meshGeometry(cols, rows, width, height);
+      writeMeshUniforms();
+      return drawGpuWarpTextureEntry(
+        itemDeformSourceEntry,
+        geometry,
+        options.gpuWarpSpec || null,
+        shadowReceiverView,
+        false,
+        "load",
+      );
+    }
+
+    function drawHighlightSource(points, { alpha = 1, aspect = 1, diameter = 16 } = {}) {
+      const left = points?.[0];
+      const right = points?.[1];
+      if (!left || !right) return false;
+      const radiusY = Math.max(0.001, diameter * 0.5);
+      const radiusX = Math.max(0.001, radiusY * aspect);
+      const leftRotation = eyeLensRotationForIndex(0);
+      const rightRotation = eyeLensRotationForIndex(1);
+      writeStageUniform([
+        width,
+        height,
+        clamp(alpha, 0, 1),
+        0,
+        left.x,
+        left.y,
+        radiusX,
+        radiusY,
+        right.x,
+        right.y,
+        radiusX,
+        radiusY,
+        Math.cos(leftRotation),
+        Math.sin(leftRotation),
+        Math.cos(rightRotation),
+        Math.sin(rightRotation),
+      ]);
+      const encoder = device.createCommandEncoder();
+      encodeFullscreenPass(
+        encoder,
+        stageHighlightSourcePipeline,
+        stageHighlightSourceBindGroup,
+        highlightSourceView,
+        "clear",
+      );
+      device.queue.submit([encoder.finish()]);
+      return true;
+    }
+
+    function drawHighlightSourceWarpedToStage(cols, rows, options = {}) {
+      if (!options.characterTransform) return false;
+      const geometry = meshGeometry(cols, rows, width, height);
+      writeMeshUniforms(
+        stageWidth,
+        stageHeight,
+        stageTransformValues(options.characterTransform),
+        clamp(options.alpha ?? 1, 0, 1),
+      );
+      return drawGpuWarpTextureEntry(
+        highlightSourceEntry,
+        geometry,
+        options.gpuWarpSpec || null,
+        stageCurrentTextureView(),
+        true,
+        "load",
+      );
+    }
+
+    function clearFrontHairShadowReceiver() {
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: shadowReceiverView,
+            loadOp: "clear",
+            storeOp: "store",
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          },
+        ],
+      });
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+    }
+
+    function drawFrontHairShadowReceiverQuad(image, corners, { alpha = 1 } = {}) {
+      drawQuadToTarget(image, corners, {
+        alpha,
+        height,
+        targetView: shadowReceiverView,
+        width,
+      });
+    }
+
+    function drawFrontHairShadowReceiverWarpedImage(image, cols, rows, options = {}) {
+      if (!image) return false;
+      const gpuWarpSpec = options.gpuWarpSpec || null;
+      const imgW = image.naturalWidth || image.width;
+      const imgH = image.naturalHeight || image.height;
+      const geometry = meshGeometry(cols, rows, imgW, imgH);
+      writeMeshUniforms();
+      return drawGpuWarp(image, geometry, gpuWarpSpec, shadowReceiverView, false, "load");
+    }
+
+    function drawFrontHairShadowComposite(image, cols, rows, options = {}) {
+      if (disposed || resources.lost) throw new Error("WebGPU mesh renderer is unavailable");
+      const gpuWarpSpec = options.gpuWarpSpec || null;
+      if (gpuWarpSpec?.kind !== "hair-shadow-v1") {
+        throw new Error("WebGPU front hair shadow draw requires a shadow hair warp spec");
+      }
+
+      const imgW = image.naturalWidth || image.width;
+      const imgH = image.naturalHeight || image.height;
+      const geometry = meshGeometry(cols, rows, imgW, imgH);
+      writeMeshUniforms();
+      if (!drawGpuWarp(image, geometry, gpuWarpSpec, shadowShapeView)) {
+        throw new Error("WebGPU front hair shadow warp failed");
+      }
+      const blur = Math.max(0, Number(options.blur) || 0);
+      device.queue.writeBuffer(
+        shadowBlurHorizontalUniformBuffer,
+        0,
+        new Float32Array([blur / width, 0, 0, 0]),
+      );
+      device.queue.writeBuffer(
+        shadowBlurVerticalUniformBuffer,
+        0,
+        new Float32Array([0, blur / height, 0, 0]),
+      );
+
+      const maskBindGroup = device.createBindGroup({
+        layout: shadowMaskPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: sampler },
+          { binding: 1, resource: shadowShapeView },
+          { binding: 2, resource: shadowReceiverView },
+        ],
+      });
+      const encoder = device.createCommandEncoder();
+      encodeFullscreenPass(
+        encoder,
+        shadowBlurPipeline,
+        shadowBlurHorizontalBindGroup,
+        shadowBlurView,
+      );
+      encodeFullscreenPass(
+        encoder,
+        shadowBlurPipeline,
+        shadowBlurVerticalBindGroup,
+        shadowShapeView,
+      );
+
+      encodeFullscreenPass(encoder, shadowMaskPipeline, maskBindGroup, shadowCompositeView);
+      device.queue.submit([encoder.finish()]);
+      return true;
+    }
+
+    return {
+      canvas: meshCanvas,
+      rendererKind: 'webgpu',
+      dispose() {
+        if (disposed) return;
+        disposed = true;
+        textures.forEach((entry) => destroyTextureEntry(entry));
+        textureSet.forEach((texture) => texture.destroy());
+        geometryCache.forEach((geometry) => {
+          geometry.sourcePositionBuffer.destroy();
+          geometry.texcoordBuffer.destroy();
+        });
+        faceRootControlPointBuffer.destroy();
+        faceControlPointBuffer.destroy();
+        faceUniformBuffer.destroy();
+        highlightSourceTexture.destroy();
+        hairBundleDefBuffer.destroy();
+        hairBundleSampleBuffer.destroy();
+        hairSpringBuffer.destroy();
+        hairUniformBuffer.destroy();
+        itemDeformSourceTexture.destroy();
+        shadowBlurHorizontalUniformBuffer.destroy();
+        shadowBlurTexture.destroy();
+        shadowBlurVerticalUniformBuffer.destroy();
+        shadowCompositeTexture.destroy();
+        shadowReceiverTexture.destroy();
+        shadowShapeTexture.destroy();
+        stageUniformBuffer.destroy();
+        uniformBuffer.destroy();
+        textures.clear();
+        textureSet.clear();
+        geometryCache.clear();
+        context.unconfigure();
+        stageContext.unconfigure();
+      },
+      beginStageFrame,
+      clearFrontHairShadowReceiver,
+      drawFrontHairShadowComposite,
+      drawFrontHairShadowReceiverQuad,
+      drawFrontHairShadowReceiverWarpedImage,
+      drawFrontHairShadowToStage,
+      drawItemDeformSource,
+      drawItemDeformSourceWarpedToShadowReceiver,
+      drawItemDeformSourceWarpedToStage,
+      drawHighlightSource,
+      drawHighlightSourceWarpedToStage,
+      drawStageGroundShadow,
+      drawStageQuad,
+      drawStageWarpedImage,
+      isLost() {
+        return disposed || resources.lost;
+      },
+      draw(image, cols, rows, options = {}) {
+        if (disposed || resources.lost) throw new Error("WebGPU mesh renderer is unavailable");
+        const imgW = image.naturalWidth || image.width;
+        const imgH = image.naturalHeight || image.height;
+        const geometry = meshGeometry(cols, rows, imgW, imgH);
+        writeMeshUniforms();
+        if (drawGpuWarp(image, geometry, options.gpuWarpSpec)) return;
+        throw new Error("WebGPU mesh draw is missing a GPU warp spec");
+      },
+      resizeStage,
+    };
+  }
+
   function createMeshRenderer(width, height) {
     const meshCanvas = document.createElement("canvas");
     meshCanvas.width = width;
@@ -6477,6 +8959,7 @@
 
     return {
       canvas: meshCanvas,
+      rendererKind: "canvas",
       dispose() {
         if (disposed) return;
         disposed = true;
@@ -6540,7 +9023,7 @@
     };
   }
 
-  function drawMeshCroppedImage(targetCtx, image, warpFn, cols = 12, rows = 8) {
+  function drawMeshCroppedImage(targetCtx, image, warpFn, cols = 12, rows = 8, options = {}) {
     if (!image) return;
     if (OBS_MODE) {
       const quality = currentObsQuality();
@@ -6548,15 +9031,26 @@
       cols = Math.max(4, Math.round(cols * qualityScale));
       rows = Math.max(3, Math.round(rows * qualityScale));
     }
-    if (meshRenderer) {
+    if (meshRenderer && meshRenderer.rendererKind !== "webgpu") {
       try {
-        meshRenderer.draw(image, warpFn, cols, rows);
-        targetCtx.drawImage(meshRenderer.canvas, 0, 0);
-        return;
+        if (meshRenderer.draw(image, warpFn, cols, rows, options) !== false) {
+          targetCtx.drawImage(meshRenderer.canvas, 0, 0);
+          return;
+        }
       } catch (error) {
-        console.warn("WebGLメッシュ描画に失敗したためCanvas描画へ切り替えます。", error);
+        const failedRendererKind = meshRenderer.rendererKind;
+        console.warn(rendererKindLabel(failedRendererKind) + "メッシュ描画に失敗したためCanvas描画へ切り替えます。", error);
         meshRenderer.dispose?.();
         meshRenderer = null;
+        activeRendererKind = "canvas";
+        if (failedRendererKind === "webgpu") {
+          try {
+            meshRenderer = createMeshRenderer(CROP.w, CROP.h);
+          } catch (fallbackError) {
+            console.warn("WebGLメッシュ初期化に失敗したためCanvas描画で続行します。", fallbackError);
+          }
+        }
+        syncRendererModeUi();
       }
     }
 
@@ -7502,6 +9996,78 @@
     return { centerX, centerY, anchorX, anchorY, pivotX, pivotY, scaleX, scaleY, rotation, drawW, drawH, pyokoVoice, frozenSetup };
   }
 
+  function gpuStageActive() {
+    return Boolean(meshRenderer?.rendererKind === "webgpu" && meshRenderer.beginStageFrame && !meshRenderer.isLost?.());
+  }
+
+  function fallbackFromLostWebGpuRenderer() {
+    if (meshRenderer?.rendererKind !== "webgpu" || !meshRenderer.isLost?.()) return;
+    console.warn("WebGPUデバイスが失われたためCanvas/WebGL描画へ切り替えます。");
+    try {
+      meshRenderer.dispose?.();
+    } catch (disposeError) {
+      console.warn("meshRenderer dispose failed", disposeError);
+    }
+    meshRenderer = null;
+    activeRendererKind = "canvas";
+    setStageArtVisible(false);
+    try {
+      meshRenderer = createMeshRenderer(CROP.w, CROP.h);
+    } catch (fallbackError) {
+      console.warn("WebGLメッシュ初期化に失敗したためCanvas描画で続行します。", fallbackError);
+    }
+    syncRendererModeUi();
+  }
+
+  function disposeGpuStageAfterDrawError(label, error) {
+    console.warn(`${label}に失敗したためCanvas/WebGL描画へ切り替えます。`, error);
+    try {
+      meshRenderer?.dispose?.();
+    } catch (disposeError) {
+      console.warn("meshRenderer dispose failed", disposeError);
+    }
+    meshRenderer = null;
+    activeRendererKind = "canvas";
+    rendererFallbackRequested = true;
+    setStageArtVisible(false);
+    try {
+      meshRenderer = createMeshRenderer(CROP.w, CROP.h);
+    } catch (fallbackError) {
+      console.warn("WebGLメッシュ初期化に失敗したためCanvas描画で続行します。", fallbackError);
+    }
+    syncRendererModeUi();
+  }
+
+  function retryRenderAfterRendererFallback(retryingAfterRendererFallback) {
+    if (retryingAfterRendererFallback || !rendererFallbackRequested) return false;
+    rendererFallbackRequested = false;
+    render({ retryingAfterRendererFallback: true });
+    return true;
+  }
+
+  function characterLocalRectStageCorners() {
+    const corners = [
+      charPointToStage({ x: 0, y: 0 }),
+      charPointToStage({ x: CROP.w, y: 0 }),
+      charPointToStage({ x: CROP.w, y: CROP.h }),
+      charPointToStage({ x: 0, y: CROP.h }),
+    ];
+    return corners.every(Boolean) ? corners : null;
+  }
+
+  function drawGpuStageWarpedImage(image, cols, rows, options = {}) {
+    if (!gpuStageActive() || !lastCharacterTransform) return false;
+    try {
+      return meshRenderer.drawStageWarpedImage(image, cols, rows, {
+        ...options,
+        characterTransform: lastCharacterTransform,
+      });
+    } catch (error) {
+      disposeGpuStageAfterDrawError("WebGPUステージメッシュ描画", error);
+      return false;
+    }
+  }
+
   function clearCharacterCanvas() {
     charCtx.setTransform(1, 0, 0, 1, 0, 0);
     charCtx.globalAlpha = 1;
@@ -7530,6 +10096,9 @@
   }
 
   function drawCharacterAnchoredItemLayers(slotKey) {
+    if (gpuStageActive() && drawArtItemLayers(slotKey)) {
+      return;
+    }
     ctx.save();
     if (applyCharacterLocalTransform(ctx)) {
       drawItemLayers(ctx, slotKey);
@@ -7539,6 +10108,14 @@
 
   function drawBackHairLayer() {
     if (!state.hairVisible) return;
+    if (
+      gpuStageActive() &&
+      drawGpuStageWarpedImage(images.backHair, 14, 10, {
+        gpuWarpSpec: buildHairGpuWarpSpec("back"),
+      })
+    ) {
+      return;
+    }
     const backHairImage = getTintedHairImage(images.backHair);
     clearCharacterCanvas();
     drawMeshCroppedImage(charCtx, backHairImage, (x, y) => hairWarpPoint(x, y, "back"), 14, 10);
@@ -7560,6 +10137,24 @@
       offsetX: clamp(yaw * 2.8, -7, 7) + distance * 0.12,
       offsetY: distance + clamp(pitch * 1.6, -2, 3),
       blur: clamp(distance * 0.18 + 1.2, 1.2, 5.2),
+    };
+  }
+
+  function frontHairShadowShouldRefresh() {
+    if (frontHairShadowCompositeFrame < 0) return true;
+    if (state.editMode || setupModeActive() || state.rangePreviewDirection) return true;
+    return motionFrameId - frontHairShadowCompositeFrame >= 2;
+  }
+
+  function frontHairShadowShapeSpec(distance) {
+    const { offsetX, offsetY, blur } = frontHairShadowGeometry(distance);
+    return {
+      blur,
+      gpuWarpSpec: buildHairGpuWarpSpec("front", {
+        offsetX,
+        offsetY,
+        tint: [0x3b / 255, 0x25 / 255, 0x20 / 255, 1],
+      }),
     };
   }
 
@@ -7594,6 +10189,299 @@
     return { blur };
   }
 
+  function currentHairTintUniform() {
+    const color = normalizeHexColor(state.hairColor);
+    const lightness = clamp(Number(state.hairTintLightness) || 0, 0, 100) / 100;
+    const enabled = Boolean(state.hairTintEnabled && (color !== "#2C292C" || lightness > 0));
+    const rgb = hexToRgb(color);
+    return {
+      enabled,
+      lightness,
+      rgb: [rgb.r / 255, rgb.g / 255, rgb.b / 255],
+      signature: enabled ? `${color}:${lightness}` : "none",
+    };
+  }
+
+  function buildLayerGpuControlPoints(layer) {
+    const controlPoints = new Float32Array(MESH_FACE_CONTROL_POINT_COUNT * 2);
+    let controlIndex = 0;
+    for (let row = 0; row <= DEFORMER_ROWS; row += 1) {
+      for (let col = 0; col <= DEFORMER_COLS; col += 1) {
+        const point = interpolatedControlPoint(layer, col, row);
+        controlPoints[controlIndex] = point.x;
+        controlPoints[controlIndex + 1] = point.y;
+        controlIndex += 2;
+      }
+    }
+    return controlPoints;
+  }
+
+  function writeHairSpringBucket(target, vec4Index, bucket) {
+    let offset = vec4Index * 4;
+    target[offset] = bucket.anglePos;
+    target[offset + 1] = bucket.anglePosY;
+    target[offset + 2] = bucket.wavePosX;
+    target[offset + 3] = bucket.wavePosY;
+    offset += 4;
+    target[offset] = bucket.headPosX;
+    target[offset + 1] = bucket.headPosY;
+    target[offset + 2] = bucket.headVelX;
+    target[offset + 3] = bucket.headVelY;
+    offset += 4;
+    target[offset] = bucket.angleVel;
+    target[offset + 1] = bucket.angleVelY;
+    target[offset + 2] = bucket.stretchX;
+    target[offset + 3] = bucket.stretchY;
+  }
+
+  function buildFaceGpuWarpSpec(includeTearLens = true, includeEyeCenters = includeTearLens) {
+    if (faceGpuWarpSpecCacheFrame !== motionFrameId || !faceGpuWarpSpecCache) {
+      faceGpuWarpSpecCacheFrame = motionFrameId;
+      faceGpuWarpSpecCache = new Map();
+    }
+    const cacheKey = `${includeTearLens ? "tear" : "plain"}:${includeEyeCenters ? "eyes" : "no-eyes"}`;
+    const cached = faceGpuWarpSpecCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const uniforms = new Float32Array(MESH_FACE_UNIFORM_VEC4_COUNT * 4);
+    const controlPoints = buildLayerGpuControlPoints("face");
+    const setUniform = (index, x = 0, y = 0, z = 0, w = 0) => {
+      const offset = index * 4;
+      uniforms[offset] = x;
+      uniforms[offset + 1] = y;
+      uniforms[offset + 2] = z;
+      uniforms[offset + 3] = w;
+    };
+
+    const metrics = currentFaceRigMetrics();
+    const anchors = metrics.anchors;
+    const pyoko = pyokoScale();
+    const yaw = clamp(state.angleX * (state.angleStrength / 100), -1.6, 1.6);
+    const pitch = clamp(state.angleY * (state.angleStrength / 100), -1.6, 1.6);
+    const depthStrength = state.editMode ? 0 : faceTurnDepthAmount();
+    const verticalDepth = state.editMode ? 0 : faceTurnVerticalAmount();
+    const diagonalEnabled =
+      state.diagonalFaceWarpEnabled &&
+      !state.editMode &&
+      !state.eyeSetupMode &&
+      !state.highlightSetupMode &&
+      !state.faceDepthSetupMode &&
+      !state.neckPivotSetupMode &&
+      !state.hairBundleSetupMode &&
+      !characterWizard?.active
+        ? 1
+        : 0;
+    const mouthPuni =
+      state.editMode || state.eyeSetupMode || state.faceDepthSetupMode
+        ? 0
+        : clamp(jawPuniLevel * pyoko, 0, 1.35);
+    const tearEnabled =
+      includeTearLens &&
+      !state.eyeSetupMode &&
+      !state.faceDepthSetupMode &&
+      state.tearLensEnabled &&
+      state.tearLensStrength > 0 &&
+      !blinkClosed;
+    const centers = tearEnabled || includeEyeCenters ? ensureEyeCenters() : null;
+    const radius = eyeLensRadius();
+    const leftCenter = centers?.[0] || { x: 0, y: 0 };
+    const rightCenter = centers?.[1] || { x: 0, y: 0 };
+    const leftWarped = centers
+      ? highlightEyesWarped?.[0] || faceWarpPoint(leftCenter.x, leftCenter.y)
+      : { x: 0, y: 0 };
+    const rightWarped = centers
+      ? highlightEyesWarped?.[1] || faceWarpPoint(rightCenter.x, rightCenter.y)
+      : { x: 0, y: 0 };
+    const leftRotation = eyeLensRotationForIndex(0);
+    const rightRotation = eyeLensRotationForIndex(1);
+    const leftShimmer =
+      Math.sin(TAU * (animationSeconds * 1.45)) * 0.006 +
+      Math.sin(TAU * (animationSeconds * 2.35)) * 0.003;
+    const rightShimmer =
+      Math.sin(TAU * (animationSeconds * 1.45 + 0.17)) * 0.006 +
+      Math.sin(TAU * (animationSeconds * 2.35 + 0.31)) * 0.003;
+
+    setUniform(0, CROP.w, CROP.h);
+    setUniform(1, metrics.faceCenter.x, metrics.faceCenter.y, metrics.center.x, metrics.center.y);
+    setUniform(2, metrics.radiusX, metrics.radiusY, metrics.topY, metrics.bottomY);
+    setUniform(3, metrics.eyeDistance, metrics.scale, voiceLevel * pyoko, mouthMotionLevel);
+    setUniform(4, anchors.leftEye.x, anchors.leftEye.y, anchors.rightEye.x, anchors.rightEye.y);
+    setUniform(5, anchors.nose.x, anchors.nose.y, anchors.mouth.x, anchors.mouth.y);
+    setUniform(6, anchors.chin.x, anchors.chin.y, metrics.eyeMid.x, metrics.eyeMid.y);
+    setUniform(7, yaw, pitch, depthStrength, verticalDepth);
+    setUniform(8, diagonalEnabled);
+    setUniform(9, mouthPuni);
+    setUniform(10, centers ? 1 : 0, state.tearLensStrength / 25, radius.x, radius.y);
+    setUniform(11, leftCenter.x, leftCenter.y, rightCenter.x, rightCenter.y);
+    setUniform(12, leftWarped.x, leftWarped.y, rightWarped.x, rightWarped.y);
+    setUniform(
+      13,
+      Math.cos(-leftRotation),
+      Math.sin(-leftRotation),
+      Math.cos(leftRotation),
+      Math.sin(leftRotation),
+    );
+    setUniform(
+      14,
+      Math.cos(-rightRotation),
+      Math.sin(-rightRotation),
+      Math.cos(rightRotation),
+      Math.sin(rightRotation),
+    );
+    setUniform(
+      15,
+      highlightPulseLeftX - 1,
+      highlightPulseLeftY - 1,
+      highlightPulseRightX - 1,
+      highlightPulseRightY - 1,
+    );
+    setUniform(16, leftShimmer, rightShimmer);
+
+    const spec = {
+      controlPoints,
+      kind: "face-v1",
+      uniforms,
+    };
+    faceGpuWarpSpecCache.set(cacheKey, spec);
+    return spec;
+  }
+
+  function buildHighlightGpuWarpSpec(filmWobbleValue = state.highlightFilmWobble) {
+    const cacheKey = `${filmWobbleValue}`;
+    if (highlightGpuWarpSpecCacheFrame !== motionFrameId || !highlightGpuWarpSpecCache) {
+      highlightGpuWarpSpecCacheFrame = motionFrameId;
+      highlightGpuWarpSpecCache = new Map();
+    }
+    const cached = highlightGpuWarpSpecCache.get(cacheKey);
+    if (cached) return cached;
+
+    const faceSpec = buildFaceGpuWarpSpec(false, true);
+    const hairUniforms = new Float32Array(MESH_HAIR_UNIFORM_VEC4_COUNT * 4);
+    const setUniform = (index, x = 0, y = 0, z = 0, w = 0) => {
+      const offset = index * 4;
+      hairUniforms[offset] = x;
+      hairUniforms[offset + 1] = y;
+      hairUniforms[offset + 2] = z;
+      hairUniforms[offset + 3] = w;
+    };
+
+    const ax = state.angleX * (state.angleStrength / 100);
+    const ay = state.angleY * (state.angleStrength / 100);
+    setUniform(4, ax * 3, ay * 3);
+
+    const film = computeHighlightFilmWobble(filmWobbleValue);
+    if (film.amount > 0) {
+      setUniform(5, film.scaleX, film.scaleY, film.shearX, film.shearY);
+      setUniform(6, Math.cos(film.rotation), Math.sin(film.rotation), film.slideX, film.slideY);
+      setUniform(7, film.pivotX, film.pivotY);
+    } else {
+      setUniform(5, 1, 1, 0, 0);
+      setUniform(6, 1, 0, 0, 0);
+    }
+
+    const spec = {
+      controlPoints: faceSpec.controlPoints,
+      hairUniforms,
+      kind: "highlight-v1",
+      uniforms: faceSpec.uniforms,
+    };
+    highlightGpuWarpSpecCache.set(cacheKey, spec);
+    return spec;
+  }
+
+  function buildHairGpuWarpSpec(layer, shadowOffset = null) {
+    const layerKey = layer === "front" ? "frontHair" : "backHair";
+    if (hairGpuWarpSpecCacheFrame !== motionFrameId || !hairGpuWarpSpecCache) {
+      hairGpuWarpSpecCacheFrame = motionFrameId;
+      hairGpuWarpSpecCache = new Map();
+    }
+    const shadowTint = shadowOffset?.tint || null;
+    const hairTint = shadowTint ? null : currentHairTintUniform();
+    const cacheKey = shadowOffset
+      ? `${layer}:shadow:${shadowOffset.offsetX}:${shadowOffset.offsetY}:${shadowTint?.join(",") || ""}`
+      : `${layer}:tint:${hairTint.signature}`;
+    const cached = hairGpuWarpSpecCache.get(cacheKey);
+    if (cached) return cached;
+
+    const faceSpec = buildFaceGpuWarpSpec(false, false);
+    const hairUniforms = new Float32Array(MESH_HAIR_UNIFORM_VEC4_COUNT * 4);
+    const hairSpringSamples = new Float32Array(MESH_HAIR_SPRING_VEC4_COUNT * 4);
+    const hairBundleDefs = new Float32Array(MESH_HAIR_BUNDLE_DEF_VEC4_COUNT * 4);
+    const hairBundleSamples = new Float32Array(MESH_HAIR_BUNDLE_SAMPLE_VEC4_COUNT * 4);
+    const setUniform = (index, x = 0, y = 0, z = 0, w = 0) => {
+      const offset = index * 4;
+      hairUniforms[offset] = x;
+      hairUniforms[offset + 1] = y;
+      hairUniforms[offset + 2] = z;
+      hairUniforms[offset + 3] = w;
+    };
+
+    const ax = state.angleX * (state.angleStrength / 100);
+    const ay = state.angleY * (state.angleStrength / 100);
+    const head = computeHeadOffset();
+    const isFront = layer === "front";
+    setUniform(0, CROP.w, CROP.h, isFront ? 1 : 0);
+    setUniform(1, ax, ay, hairWarpAmount(), state.hairSpring / 100);
+    setUniform(2, head.x, head.y, frontHairRootFollowAmount(), hairBundleStrengthAmount());
+    setUniform(
+      3,
+      state.editMode || setupModeActive() ? 0 : 1,
+      shadowOffset?.offsetX || 0,
+      shadowOffset?.offsetY || 0,
+      shadowOffset ? 1 : 0,
+    );
+    if (shadowTint)
+      setUniform(4, shadowTint[0], shadowTint[1], shadowTint[2], shadowTint[3] ?? 1);
+    else if (hairTint?.enabled) {
+      setUniform(4, hairTint.rgb[0], hairTint.rgb[1], hairTint.rgb[2], 1);
+      setUniform(5, hairTint.lightness, 0, 0, 0);
+    }
+
+    const spring = isFront ? hairSpringFront : hairSpringBack;
+    for (let index = 0; index < HAIR_SPRING_BUCKETS; index += 1) {
+      writeHairSpringBucket(hairSpringSamples, index * 3, spring.buckets[index]);
+    }
+
+    const rig = currentHairBundleRig();
+    const bundleStates = ensureHairBundleSpringStates();
+    for (let defIndex = 0; defIndex < HAIR_BUNDLE_DEFS.length; defIndex += 1) {
+      const def = HAIR_BUNDLE_DEFS[defIndex];
+      const line = rig[def.key];
+      const defOffset = defIndex * 8;
+      hairBundleDefs[defOffset] = line?.root?.x || 0;
+      hairBundleDefs[defOffset + 1] = line?.root?.y || 0;
+      hairBundleDefs[defOffset + 2] = line?.tip?.x || 0;
+      hairBundleDefs[defOffset + 3] = line?.tip?.y || 0;
+      hairBundleDefs[defOffset + 4] = def.layer === "front" ? 1 : 0;
+      hairBundleDefs[defOffset + 5] = def.width;
+      hairBundleDefs[defOffset + 6] = def.layer === layer ? 1 : 0;
+      const bundleSpring = bundleStates[def.key];
+      for (let index = 0; index < HAIR_SPRING_BUCKETS; index += 1) {
+        writeHairSpringBucket(
+          hairBundleSamples,
+          (defIndex * HAIR_SPRING_BUCKETS + index) * 3,
+          bundleSpring.buckets[index],
+        );
+      }
+    }
+
+    const spec = {
+      controlPoints: buildLayerGpuControlPoints(layerKey),
+      faceRootControlPoints: faceSpec.controlPoints,
+      hairBundleDefs,
+      hairBundleSamples,
+      hairSpringSamples,
+      hairTintEnabled: Boolean(hairTint?.enabled),
+      hairUniforms,
+      kind: shadowTint ? "hair-shadow-v1" : "hair-v1",
+      uniforms: faceSpec.uniforms,
+    };
+    hairGpuWarpSpecCache.set(cacheKey, spec);
+    return spec;
+  }
+
   function currentFaceMeshSpec() {
     const useTearLensMesh = state.tearLensEnabled && state.tearLensStrength > 0 && !state.eyeSetupMode && !state.faceDepthSetupMode && !blinkClosed;
     const yaw = Math.abs(clamp(state.angleX * (state.angleStrength / 100), -1.6, 1.6));
@@ -7601,12 +10489,56 @@
     const useHighMesh = useTearLensMesh || useFeatureTurnMesh;
     return {
       warpFn: (x, y) => tearLensWarpPoint(x, y),
+      gpuWarpSpec: () => buildFaceGpuWarpSpec(true),
       cols: useHighMesh ? 28 : 14,
       rows: useHighMesh ? 20 : 10,
     };
   }
 
+  function drawFrontHairShadowReceiverItemLayer(layer) {
+    if (!layer?.visible || !layer.image || !gpuStageActive()) return;
+    const deformSpec = itemLayerDeformFollowSpec(layer);
+    if (deformSpec) {
+      if (!prepareDeformedItemSource(layer)) return;
+      meshRenderer.drawItemDeformSourceWarpedToShadowReceiver(deformSpec.cols, deformSpec.rows, {
+        gpuWarpSpec: deformSpec.gpuWarpSpec?.(),
+      });
+      return;
+    }
+    const corners = itemLayerRenderedLocalCorners(layer);
+    if (!corners) return;
+    meshRenderer.drawFrontHairShadowReceiverQuad(layer.image, corners, {
+      alpha: clamp(layer.opacity / 100, 0, 1),
+    });
+  }
+
+  function drawFrontHairShadowReceiverItemLayers(slotKey) {
+    for (const layer of itemLayers) {
+      if (layer.slot === slotKey) drawFrontHairShadowReceiverItemLayer(layer);
+    }
+  }
+
   function drawFrontHairShadowReceiverMask() {
+    if (gpuStageActive()) {
+      try {
+        meshRenderer.clearFrontHairShadowReceiver();
+        drawFrontHairShadowReceiverItemLayers("characterBack");
+        meshRenderer.drawFrontHairShadowReceiverWarpedImage(images.backHair, 14, 10, {
+          gpuWarpSpec: buildHairGpuWarpSpec("back"),
+        });
+        drawFrontHairShadowReceiverItemLayers("faceBack");
+        const faceSpec = currentFaceMeshSpec();
+        meshRenderer.drawFrontHairShadowReceiverWarpedImage(images[expressionKey()], faceSpec.cols, faceSpec.rows, {
+          gpuWarpSpec: faceSpec.gpuWarpSpec(),
+        });
+        drawFrontHairShadowReceiverItemLayers("faceFront");
+        return true;
+      } catch (error) {
+        disposeGpuStageAfterDrawError("WebGPU前髪影受け面描画", error);
+        return false;
+      }
+    }
+
     frontHairShadowReceiverCtx.setTransform(1, 0, 0, 1, 0, 0);
     frontHairShadowReceiverCtx.globalAlpha = 1;
     frontHairShadowReceiverCtx.globalCompositeOperation = "source-over";
@@ -7627,6 +10559,33 @@
     if (OBS_MODE && normalizeObsPresetKey(obsPresetKey) === "light") return;
     if (!state.hairVisible) return;
     if (!state.frontHairShadowEnabled || strength <= 0.001 || distance <= 0.001 || !images.frontHair || !lastCharacterTransform) return;
+
+    if (gpuStageActive()) {
+      let gpuDrawn = true;
+      if (frontHairShadowShouldRefresh()) {
+        const { blur, gpuWarpSpec } = frontHairShadowShapeSpec(distance);
+        gpuDrawn = drawFrontHairShadowReceiverMask();
+        if (gpuDrawn) {
+          try {
+            meshRenderer.drawFrontHairShadowComposite(images.frontHair, 14, 10, { blur, gpuWarpSpec });
+            frontHairShadowCompositeFrame = motionFrameId;
+          } catch (error) {
+            disposeGpuStageAfterDrawError("WebGPU前髪影合成", error);
+            gpuDrawn = false;
+          }
+        }
+      }
+
+      if (gpuDrawn && gpuStageActive()) {
+        try {
+          const corners = characterLocalRectStageCorners();
+          if (corners) meshRenderer.drawFrontHairShadowToStage(corners, { alpha: strength * 0.62 });
+          return;
+        } catch (error) {
+          disposeGpuStageAfterDrawError("WebGPU前髪影ステージ描画", error);
+        }
+      }
+    }
 
     const { blur } = drawFrontHairShadowShape(distance);
     drawFrontHairShadowReceiverMask();
@@ -7653,9 +10612,50 @@
     ctx.restore();
   }
 
+  function drawGpuHighlightDots(points, diameter, aspect, filmWobbleValue, alpha, sourceAlpha = 1) {
+    if (!gpuStageActive() || !lastCharacterTransform || !points) return false;
+    try {
+      if (!meshRenderer.drawHighlightSource(points, { alpha: sourceAlpha, aspect, diameter })) return false;
+      meshRenderer.drawHighlightSourceWarpedToStage(14, 10, {
+        alpha,
+        characterTransform: lastCharacterTransform,
+        gpuWarpSpec: buildHighlightGpuWarpSpec(filmWobbleValue),
+      });
+      return true;
+    } catch (error) {
+      disposeGpuStageAfterDrawError("WebGPU目ハイライト描画", error);
+      return false;
+    }
+  }
+
   function drawFaceAndHighlightLayer() {
-    clearCharacterCanvas();
     const faceSpec = currentFaceMeshSpec();
+    if (gpuStageActive()) {
+      let gpuDrawn = drawGpuStageWarpedImage(images[expressionKey()], faceSpec.cols, faceSpec.rows, {
+        gpuWarpSpec: faceSpec.gpuWarpSpec(),
+      });
+      if (gpuDrawn && state.highlightEnabled) {
+        const points = ensureHighlightPoints();
+        if (points) {
+          const blinkAlpha = state.highlightAlphaOnBlink && blinkClosed ? 0 : 1;
+          const alpha = (state.highlightStrength / 100) * blinkAlpha;
+          gpuDrawn = drawGpuHighlightDots(points, highlightDiameter(), highlightAspectScale(), state.highlightFilmWobble, alpha);
+          if (gpuDrawn && state.subHighlightEnabled) {
+            gpuDrawn = drawGpuHighlightDots(
+              ensureSubHighlightPoints(),
+              subHighlightDiameter(),
+              subHighlightAspectScale(),
+              state.subHighlightFilmWobble,
+              alpha,
+              0.86
+            ) && gpuDrawn;
+          }
+        }
+      }
+      if (gpuDrawn && gpuStageActive()) return;
+    }
+
+    clearCharacterCanvas();
     drawMeshCroppedImage(charCtx, images[expressionKey()], faceSpec.warpFn, faceSpec.cols, faceSpec.rows);
 
     // 目ハイライト(D): 各目中心基準でぷるぷるスケール、前髪の下、まばたき連動
@@ -7685,6 +10685,14 @@
 
   function drawFrontHairLayer() {
     if (!state.hairVisible) return;
+    if (
+      gpuStageActive() &&
+      drawGpuStageWarpedImage(images.frontHair, 14, 10, {
+        gpuWarpSpec: buildHairGpuWarpSpec("front"),
+      })
+    ) {
+      return;
+    }
     const frontHairImage = getTintedHairImage(images.frontHair);
     clearCharacterCanvas();
     drawMeshCroppedImage(charCtx, frontHairImage, (x, y) => hairWarpPoint(x, y, "front"), 14, 10);
@@ -7700,6 +10708,14 @@
   }
 
   function drawBackground() {
+    if (gpuStageActive()) {
+      try {
+        meshRenderer.beginStageFrame({ bgColor: state.bgColor, transparent: OBS_TRANSPARENT });
+        return;
+      } catch (error) {
+        disposeGpuStageAfterDrawError("WebGPUステージ背景描画", error);
+      }
+    }
     ctx.clearRect(0, 0, stage.w, stage.h);
     if (OBS_TRANSPARENT) return;
     ctx.fillStyle = state.bgColor;
@@ -7727,6 +10743,14 @@
   }
 
   function drawShadow(cx, cy, rx, voice) {
+    if (gpuStageActive()) {
+      try {
+        meshRenderer.drawStageGroundShadow(cx, cy, rx, voice);
+        return;
+      } catch (error) {
+        disposeGpuStageAfterDrawError("WebGPUステージ影描画", error);
+      }
+    }
     ctx.save();
     ctx.translate(cx, cy);
     ctx.scale(1, 0.24);
@@ -7799,13 +10823,13 @@
     const target = slot.deformFollow || slot.rigidFollow;
     if (target === "face") {
       const faceSpec = currentFaceMeshSpec();
-      return { warpFn: (x, y) => faceWarpPoint(x, y), cols: faceSpec.cols, rows: faceSpec.rows };
+      return { warpFn: (x, y) => faceWarpPoint(x, y), cols: faceSpec.cols, rows: faceSpec.rows, gpuWarpSpec: () => buildFaceGpuWarpSpec(false, false) };
     }
     if (target === "frontHair") {
-      return { warpFn: (x, y) => hairWarpPoint(x, y, "front"), cols: 14, rows: 10 };
+      return { warpFn: (x, y) => hairWarpPoint(x, y, "front"), cols: 14, rows: 10, gpuWarpSpec: () => buildHairGpuWarpSpec("front") };
     }
     if (target === "backHair") {
-      return { warpFn: (x, y) => hairWarpPoint(x, y, "back"), cols: 14, rows: 10 };
+      return { warpFn: (x, y) => hairWarpPoint(x, y, "back"), cols: 14, rows: 10, gpuWarpSpec: () => buildHairGpuWarpSpec("back") };
     }
     return null;
   }
@@ -7912,6 +10936,90 @@
     ];
     const stageCorners = corners.map((corner) => itemAnchorPointToStage(layer, corner));
     return stageCorners.every(Boolean) ? stageCorners : null;
+  }
+
+  function itemLayerLocalCorners(layer) {
+    const corners = [
+      itemLayerCorner(layer, -1, -1),
+      itemLayerCorner(layer, 1, -1),
+      itemLayerCorner(layer, 1, 1),
+      itemLayerCorner(layer, -1, 1),
+    ];
+    return corners.every(Boolean) ? corners : null;
+  }
+
+  function itemLayerRenderedLocalCorners(layer) {
+    const corners = [
+      itemLayerCorner(layer, -1, -1),
+      itemLayerCorner(layer, 1, -1),
+      itemLayerCorner(layer, 1, 1),
+      itemLayerCorner(layer, -1, 1),
+    ];
+    const renderedCorners = corners.map((corner) => itemLayerRenderedAnchorPoint(layer, corner));
+    return renderedCorners.every(Boolean) ? renderedCorners : null;
+  }
+
+  function prepareDeformedItemSource(layer) {
+    if (!gpuStageActive()) return false;
+    const corners = itemLayerLocalCorners(layer);
+    if (!corners) return false;
+    try {
+      meshRenderer.drawItemDeformSource(layer.image, corners, {
+        alpha: clamp(layer.opacity / 100, 0, 1),
+      });
+      return true;
+    } catch (error) {
+      disposeGpuStageAfterDrawError("WebGPUアイテム変形元描画", error);
+      return false;
+    }
+  }
+
+  function drawArtFlatItemLayer(layer) {
+    const corners = itemLayerStageCorners(layer);
+    if (!corners) return true;
+    if (!gpuStageActive()) return false;
+    try {
+      meshRenderer.drawStageQuad(layer.image, corners, {
+        alpha: clamp(layer.opacity / 100, 0, 1),
+      });
+      return true;
+    } catch (error) {
+      disposeGpuStageAfterDrawError("WebGPUアイテム描画", error);
+      return false;
+    }
+  }
+
+  function drawArtDeformedItemLayer(layer, deformSpec) {
+    if (!lastCharacterTransform) return true;
+    if (!prepareDeformedItemSource(layer)) return false;
+    try {
+      meshRenderer.drawItemDeformSourceWarpedToStage(deformSpec.cols, deformSpec.rows, {
+        characterTransform: lastCharacterTransform,
+        gpuWarpSpec: deformSpec.gpuWarpSpec?.(),
+      });
+      return true;
+    } catch (error) {
+      disposeGpuStageAfterDrawError("WebGPUアイテム変形描画", error);
+      return false;
+    }
+  }
+
+  function drawArtItemLayer(layer) {
+    if (!layer?.visible || !layer.image) return true;
+    const deformSpec = itemLayerDeformFollowSpec(layer);
+    if (deformSpec) {
+      return drawArtDeformedItemLayer(layer, deformSpec);
+    }
+    return drawArtFlatItemLayer(layer);
+  }
+
+  function drawArtItemLayers(slotKey) {
+    if (!gpuStageActive()) return false;
+    let ok = true;
+    for (const layer of itemLayers) {
+      if (layer.slot === slotKey && !drawArtItemLayer(layer)) ok = false;
+    }
+    return ok && gpuStageActive();
   }
 
   function isPointInPolygon(point, polygon) {
@@ -9009,12 +12117,23 @@
     return true;
   }
 
-  function render() {
+  function render({ retryingAfterRendererFallback = false } = {}) {
+    if (!retryingAfterRendererFallback) rendererFallbackRequested = false;
+    fallbackFromLostWebGpuRenderer();
     resizeCanvas();
+    if (gpuStageActive()) {
+      setStageArtVisible(true);
+      meshRenderer.resizeStage(stage.w, stage.h, stage.dpr);
+      ctx.clearRect(0, 0, stage.w, stage.h);
+    } else {
+      setStageArtVisible(false);
+    }
     drawBackground();
-    drawItemLayers(ctx, "stageBack");
+    const stageBackDrawn = gpuStageActive() && drawArtItemLayers("stageBack");
+    if (!stageBackDrawn) drawItemLayers(ctx, "stageBack");
     if (!imagesReady) {
       drawLoading();
+      if (retryRenderAfterRendererFallback(retryingAfterRendererFallback)) return;
       return;
     }
 
@@ -9034,7 +12153,9 @@
     drawFrontHairLayer();
     drawCharacterAnchoredItemLayers("frontHairFront");
     drawCharacterMeshGuideLayer();
-    drawItemLayers(ctx, "stageFront");
+    const stageFrontDrawn = gpuStageActive() && drawArtItemLayers("stageFront");
+    if (!stageFrontDrawn) drawItemLayers(ctx, "stageFront");
+    if (retryRenderAfterRendererFallback(retryingAfterRendererFallback)) return;
     if (OBS_MODE) return;
     drawItemSelectionOverlay();
     drawEditOverlay();
@@ -9445,20 +12566,46 @@
     updateVoiceFromRaw(raw, nowMs);
   }
 
+  function nextActiveAnimationDelayMs() {
+    if (OBS_MODE || setupModeActive() || state.rangePreviewDirection || !activeAnimationLastFrameAt) return 0;
+    return Math.max(0, activeAnimationFrameDelayMs() - (performance.now() - activeAnimationLastFrameAt) + 1);
+  }
+
+  function requestNextTick() {
+    if (tickRafId || tickTimerId) return;
+    const delay = nextActiveAnimationDelayMs();
+    if (delay > 1) {
+      tickTimerId = window.setTimeout(() => {
+        tickTimerId = 0;
+        tickRafId = requestAnimationFrame(tick);
+      }, delay);
+      return;
+    }
+    tickRafId = requestAnimationFrame(tick);
+  }
+
   function tick(timestamp) {
+    tickRafId = 0;
     const obsFrameInterval = OBS_MODE ? 1000 / currentObsRenderFps() : 0;
     const obsFrameSkipThreshold = Math.max(0, obsFrameInterval - 8);
     if (OBS_MODE && obsLastFrameAt && timestamp - obsLastFrameAt < obsFrameSkipThreshold) {
-      requestAnimationFrame(tick);
+      requestNextTick();
       return;
     }
     if (OBS_MODE) obsLastFrameAt = timestamp;
+    const setupActive = setupModeActive();
+    const activeFrameInterval = !OBS_MODE && !setupActive && !state.rangePreviewDirection ? activeAnimationFrameDelayMs() : 0;
+    const activeFrameSkipThreshold = Math.max(0, activeFrameInterval - 4);
+    if (activeFrameInterval && activeAnimationLastFrameAt && timestamp - activeAnimationLastFrameAt < activeFrameSkipThreshold) {
+      requestNextTick();
+      return;
+    }
+    activeAnimationLastFrameAt = activeFrameInterval ? timestamp : 0;
     if (!lastTimestamp) lastTimestamp = timestamp;
     const delta = Math.max(0, Math.min(0.05, (timestamp - lastTimestamp) / 1000));
     lastTimestamp = timestamp;
     motionFrameId += 1;
 
-    const setupActive = setupModeActive();
     if (setupActive || state.rangePreviewDirection) {
       if (setupActive) {
         state.targetX = 0;
@@ -9491,17 +12638,14 @@
       if (ui.mouthReadout) ui.mouthReadout.textContent = "とじ";
       if (ui.angleReadout) ui.angleReadout.textContent = `${Math.round(state.angleX * 100)}, ${Math.round(state.angleY * 100)}`;
       render();
-      requestAnimationFrame(tick);
+      requestNextTick();
       return;
     }
 
     animationSeconds += delta;
 
-    if (OBS_MODE) {
-      applyObsExternalTarget(timestamp);
-    } else {
-      updateIdleMotionTarget(timestamp);
-    }
+    if (OBS_MODE) applyObsExternalTarget(timestamp);
+    else updateIdleMotionTarget(timestamp);
     if (state.editMode) {
       setEditPreviewFromKey();
     } else {
@@ -9516,7 +12660,7 @@
     updateHairPhysics(delta);
     updateHighlightPulse(delta);
     render();
-    requestAnimationFrame(tick);
+    requestNextTick();
   }
 
   function randomBetween(min, max) {
@@ -9894,6 +13038,12 @@
   function resetFrameTimingOnResume() {
     if (document.visibilityState === "visible") {
       lastTimestamp = 0;
+      activeAnimationLastFrameAt = 0;
+      if (tickTimerId) {
+        clearTimeout(tickTimerId);
+        tickTimerId = 0;
+      }
+      requestNextTick();
     }
   }
 
@@ -10228,6 +13378,16 @@
     bindRange("mouthHalf", "mouthHalf");
     bindRange("mouthFull", "mouthFull");
     bindRange("mouthRelease", "mouthRelease");
+    bindRange("activeAnimationFps", "activeAnimationFps", "fps");
+    ui.activeAnimationFps?.addEventListener("input", () => {
+      state.activeAnimationFps = activeAnimationFps();
+      activeAnimationLastFrameAt = 0;
+      if (tickTimerId) {
+        clearTimeout(tickTimerId);
+        tickTimerId = 0;
+      }
+      requestNextTick();
+    });
     bindRange("avatarSize", "avatarSize");
     bindRange("breathStrength", "breathStrength");
     bindRange("rollStrength", "rollStrength");
@@ -10391,6 +13551,9 @@
     ui.eyeSetupSaveButton?.addEventListener("click", () => {
       saveEyeSetup();
     });
+
+    syncRendererModeUi();
+    ui.rendererModeSelect?.addEventListener("change", () => setRendererMode(ui.rendererModeSelect.value));
 
     ui.showMesh?.addEventListener("change", () => {
       state.showMesh = ui.showMesh.checked;
@@ -10741,12 +13904,7 @@
   applyObsModeDefaults();
   bindUi();
   bindLifecycleEvents();
-  try {
-    meshRenderer = createMeshRenderer(CROP.w, CROP.h);
-  } catch (error) {
-    console.warn("WebGLメッシュ初期化に失敗したためCanvas描画で起動します。", error);
-    meshRenderer = null;
-  }
+  resetMeshRendererAfterAvatarImageChange();
   scheduleBlink();
   loadAssets()
     .then(async () => {
@@ -10760,5 +13918,5 @@
       console.error("loadAssets failed", error);
     });
   connectObsEventSource();
-  requestAnimationFrame(tick);
+  requestNextTick();
 })();

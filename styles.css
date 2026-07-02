@@ -119,12 +119,22 @@ button {
   -webkit-tap-highlight-color: transparent;
 }
 
+.ppt-stage-art,
 #stage {
   position: fixed;
   inset: 0;
   width: 100vw;
   height: 100vh;
   display: block;
+}
+
+.ppt-stage-art {
+  pointer-events: none;
+  z-index: 0;
+}
+
+#stage {
+  z-index: 1;
   cursor: crosshair;
   touch-action: none;
 }
