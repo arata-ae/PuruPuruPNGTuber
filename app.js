@@ -1521,6 +1521,22 @@
     return blobToU8(await imageToPngBlob(image));
   }
 
+  function canvasToPngBlob(canvasElement, name = "Canvas") {
+    return new Promise((resolve, reject) => {
+      if (!canvasElement?.toBlob) {
+        reject(new Error(`${name}をPNGとして保存できません。`));
+        return;
+      }
+      canvasElement.toBlob((blob) => {
+        if (!blob) {
+          reject(new Error(`${name}のPNG変換に失敗しました。`));
+          return;
+        }
+        resolve(blob);
+      }, "image/png");
+    });
+  }
+
   function dataUrlToU8(dataUrl) {
     const normalized = validatePngDataUrl(dataUrl, "PNGアイテム");
     const base64 = normalized.slice(PNG_DATA_URL_PREFIX.length);
@@ -1811,7 +1827,7 @@
     files["settings.json"] = textToU8(JSON.stringify(settings, null, 2));
 
     if (canvas?.toBlob) {
-      const thumbnailBlob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      const thumbnailBlob = await captureStagePngBlob();
       if (thumbnailBlob) files["thumbnail.png"] = await blobToU8(thumbnailBlob);
     }
 
@@ -2819,6 +2835,14 @@
       const preset = currentObsPreset();
       setObsStatus(`${preset.label}プリセットを選択しました。OBS URLの貼り直しは不要です。推奨 ${preset.width}x${preset.height} / ${preset.fps}fps`);
     }
+    if (obsPublishEnabled) {
+      activeAnimationLastFrameAt = 0;
+      if (tickTimerId) {
+        clearTimeout(tickTimerId);
+        tickTimerId = 0;
+      }
+      requestNextTick();
+    }
   }
 
   async function copyObsUrl() {
@@ -2860,9 +2884,15 @@
 
   function setObsPublishEnabled(enabled) {
     obsPublishEnabled = Boolean(enabled);
+    activeAnimationLastFrameAt = 0;
+    if (tickTimerId) {
+      clearTimeout(tickTimerId);
+      tickTimerId = 0;
+    }
     syncObsPublishButton();
     const preset = currentObsPreset();
     setObsStatus(obsPublishEnabled ? `OBS連携ON: ${preset.label}プリセットで${preset.sendFps}fps上限送信します。` : "OBS連携OFF");
+    requestNextTick();
   }
 
   function requestToPromise(request) {
@@ -3131,9 +3161,35 @@
     setEditStatus(error instanceof Error ? error.message : "キャラ管理を初期化できませんでした。");
   }
 
+  function stageSnapshotCanvas() {
+    if (!gpuStageActive() || stageArtCanvas.hidden || !stageArtCanvas.width || !stageArtCanvas.height) return canvas;
+    const snapshotCanvas = document.createElement("canvas");
+    snapshotCanvas.width = canvas.width;
+    snapshotCanvas.height = canvas.height;
+    const snapshotCtx = snapshotCanvas.getContext("2d");
+    if (!snapshotCtx) return canvas;
+    try {
+      snapshotCtx.drawImage(stageArtCanvas, 0, 0, snapshotCanvas.width, snapshotCanvas.height);
+      snapshotCtx.drawImage(canvas, 0, 0, snapshotCanvas.width, snapshotCanvas.height);
+      return snapshotCanvas;
+    } catch (error) {
+      console.warn("WebGPUサムネイル合成に失敗したためCanvasサムネイルで続行します。", error);
+      return canvas;
+    }
+  }
+
+  async function captureStagePngBlob() {
+    if (!canvas?.toBlob) return null;
+    try {
+      return await canvasToPngBlob(stageSnapshotCanvas(), "ステージ");
+    } catch (error) {
+      console.warn("ステージのPNG変換に失敗しました。", error);
+      return null;
+    }
+  }
+
   async function captureCharacterThumbnailDataUrl() {
-    if (!canvas?.toBlob) return "";
-    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    const blob = await captureStagePngBlob();
     if (!blob) return "";
     return blobToDataUrl(blob);
   }
@@ -9023,14 +9079,21 @@
     };
   }
 
-  function drawMeshCroppedImage(targetCtx, image, warpFn, cols = 12, rows = 8, options = {}) {
-    if (!image) return;
+  function meshResolutionForCurrentQuality(cols, rows) {
     if (OBS_MODE) {
       const quality = currentObsQuality();
       const qualityScale = quality === "low" ? 0.58 : quality === "standard" ? 0.82 : 1;
       cols = Math.max(4, Math.round(cols * qualityScale));
       rows = Math.max(3, Math.round(rows * qualityScale));
     }
+    return { cols, rows };
+  }
+
+  function drawMeshCroppedImage(targetCtx, image, warpFn, cols = 12, rows = 8, options = {}) {
+    if (!image) return;
+    const resolution = meshResolutionForCurrentQuality(cols, rows);
+    cols = resolution.cols;
+    rows = resolution.rows;
     if (meshRenderer && meshRenderer.rendererKind !== "webgpu") {
       try {
         if (meshRenderer.draw(image, warpFn, cols, rows, options) !== false) {
@@ -10057,8 +10120,9 @@
 
   function drawGpuStageWarpedImage(image, cols, rows, options = {}) {
     if (!gpuStageActive() || !lastCharacterTransform) return false;
+    const resolution = meshResolutionForCurrentQuality(cols, rows);
     try {
-      return meshRenderer.drawStageWarpedImage(image, cols, rows, {
+      return meshRenderer.drawStageWarpedImage(image, resolution.cols, resolution.rows, {
         ...options,
         characterTransform: lastCharacterTransform,
       });
@@ -10500,7 +10564,8 @@
     const deformSpec = itemLayerDeformFollowSpec(layer);
     if (deformSpec) {
       if (!prepareDeformedItemSource(layer)) return;
-      meshRenderer.drawItemDeformSourceWarpedToShadowReceiver(deformSpec.cols, deformSpec.rows, {
+      const resolution = meshResolutionForCurrentQuality(deformSpec.cols, deformSpec.rows);
+      meshRenderer.drawItemDeformSourceWarpedToShadowReceiver(resolution.cols, resolution.rows, {
         gpuWarpSpec: deformSpec.gpuWarpSpec?.(),
       });
       return;
@@ -10523,12 +10588,14 @@
       try {
         meshRenderer.clearFrontHairShadowReceiver();
         drawFrontHairShadowReceiverItemLayers("characterBack");
-        meshRenderer.drawFrontHairShadowReceiverWarpedImage(images.backHair, 14, 10, {
+        const hairResolution = meshResolutionForCurrentQuality(14, 10);
+        meshRenderer.drawFrontHairShadowReceiverWarpedImage(images.backHair, hairResolution.cols, hairResolution.rows, {
           gpuWarpSpec: buildHairGpuWarpSpec("back"),
         });
         drawFrontHairShadowReceiverItemLayers("faceBack");
         const faceSpec = currentFaceMeshSpec();
-        meshRenderer.drawFrontHairShadowReceiverWarpedImage(images[expressionKey()], faceSpec.cols, faceSpec.rows, {
+        const faceResolution = meshResolutionForCurrentQuality(faceSpec.cols, faceSpec.rows);
+        meshRenderer.drawFrontHairShadowReceiverWarpedImage(images[expressionKey()], faceResolution.cols, faceResolution.rows, {
           gpuWarpSpec: faceSpec.gpuWarpSpec(),
         });
         drawFrontHairShadowReceiverItemLayers("faceFront");
@@ -10567,7 +10634,8 @@
         gpuDrawn = drawFrontHairShadowReceiverMask();
         if (gpuDrawn) {
           try {
-            meshRenderer.drawFrontHairShadowComposite(images.frontHair, 14, 10, { blur, gpuWarpSpec });
+            const resolution = meshResolutionForCurrentQuality(14, 10);
+            meshRenderer.drawFrontHairShadowComposite(images.frontHair, resolution.cols, resolution.rows, { blur, gpuWarpSpec });
             frontHairShadowCompositeFrame = motionFrameId;
           } catch (error) {
             disposeGpuStageAfterDrawError("WebGPU前髪影合成", error);
@@ -10616,7 +10684,8 @@
     if (!gpuStageActive() || !lastCharacterTransform || !points) return false;
     try {
       if (!meshRenderer.drawHighlightSource(points, { alpha: sourceAlpha, aspect, diameter })) return false;
-      meshRenderer.drawHighlightSourceWarpedToStage(14, 10, {
+      const resolution = meshResolutionForCurrentQuality(14, 10);
+      meshRenderer.drawHighlightSourceWarpedToStage(resolution.cols, resolution.rows, {
         alpha,
         characterTransform: lastCharacterTransform,
         gpuWarpSpec: buildHighlightGpuWarpSpec(filmWobbleValue),
@@ -10993,7 +11062,8 @@
     if (!lastCharacterTransform) return true;
     if (!prepareDeformedItemSource(layer)) return false;
     try {
-      meshRenderer.drawItemDeformSourceWarpedToStage(deformSpec.cols, deformSpec.rows, {
+      const resolution = meshResolutionForCurrentQuality(deformSpec.cols, deformSpec.rows);
+      meshRenderer.drawItemDeformSourceWarpedToStage(resolution.cols, resolution.rows, {
         characterTransform: lastCharacterTransform,
         gpuWarpSpec: deformSpec.gpuWarpSpec?.(),
       });
@@ -12602,7 +12672,8 @@
     }
     activeAnimationLastFrameAt = activeFrameInterval ? timestamp : 0;
     if (!lastTimestamp) lastTimestamp = timestamp;
-    const delta = Math.max(0, Math.min(0.05, (timestamp - lastTimestamp) / 1000));
+    const maxDelta = activeFrameInterval ? Math.max(0.05, activeFrameInterval / 1000 + 0.02) : 0.05;
+    const delta = Math.max(0, Math.min(maxDelta, (timestamp - lastTimestamp) / 1000));
     lastTimestamp = timestamp;
     motionFrameId += 1;
 
