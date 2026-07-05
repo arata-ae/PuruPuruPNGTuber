@@ -41,6 +41,21 @@
   const ACTIVE_ANIMATION_FPS_MIN = 12;
   const ACTIVE_ANIMATION_FPS_MAX = 60;
   const ACTIVE_ANIMATION_FPS_DEFAULT = 24;
+  const EMPTY_ITEM_LAYER_LIST = Object.freeze([]);
+  const PERF_STORAGE_KEY = "purupuru-pngtuber-perf-v1";
+  const PERF_PROFILER_VERSION = 2;
+  const ANIMATION_SCHEDULER_VERSION = 4;
+  const PERF_DEFAULT_SLOW_FRAME_MS = 34;
+  const PERF_DEFAULT_WINDOW_MS = 5000;
+  const PERF_DEFAULT_HIGH_DUTY_PERCENT = 20;
+  const PERF_MAX_SLOW_FRAMES = 80;
+  const PERF_MAX_OPERATIONS = 120;
+  const PERF_MAX_DUTY_WINDOWS = 24;
+  const MAX_FRAME_DELTA_SECONDS = 0.12;
+  const RAF_CADENCE_LEAD_MS = 1000 / ACTIVE_ANIMATION_FPS_MAX;
+  const RECENT_ACTIVITY_MS = 700;
+  const IDLE_MOTION_HOLD_MAX_DELAY_MS = 500;
+  const FRONT_HAIR_SHADOW_REFRESH_FRAME_INTERVAL = 4;
 
   const ASSETS = {
     backHair: "assets/demo-avatar/back-hair.png",
@@ -143,12 +158,19 @@
   const MAX_OBS_SNAPSHOT_AVATAR_IMAGE_DATA_URL_SIZE = 12 * 1024 * 1024;
   const MAX_ITEM_IMAGE_EDGE = 4096;
   const MAX_ITEM_IMAGE_PIXELS = 16 * 1024 * 1024;
+  const MAX_AVATAR_IMAGE_EDGE = 4096;
+  const MAX_AVATAR_IMAGE_PIXELS = 16 * 1024 * 1024;
   const MAX_ITEM_LAYER_COUNT = 20;
   const ITEM_TRIM_ALPHA_THRESHOLD = 1;
   const ITEM_INITIAL_MAX_WIDTH_RATIO = 0.82;
   const ITEM_INITIAL_MAX_HEIGHT_RATIO = 0.82;
   const ITEM_RESIZE_HANDLE_RADIUS = 18;
   const MAX_JSON_SANITIZE_DEPTH = 32;
+  const MAX_JSON_KEYS_PER_OBJECT = 2000;
+  const MAX_JSON_ARRAY_LENGTH = 2000;
+  const MAX_JSON_STRING_LENGTH = 4 * 1024 * 1024;
+  const MAX_JSON_DATA_URL_STRING_LENGTH = 5 * 1024 * 1024;
+  const MAX_JSON_NODE_COUNT = 50000;
   const FORBIDDEN_JSON_KEYS = new Set(["__proto__", "constructor", "prototype"]);
   const HAIR_TINT_CACHE_LIMIT = 8;
   const PNG_DATA_URL_PREFIX = "data:image/png;base64,";
@@ -676,6 +698,7 @@
   let imagesReady = false;
   let avatarPackageImageVersion = 0;
   let loadError = "";
+  let loadErrorFramePending = false;
   let stage = { w: window.innerWidth, h: window.innerHeight, dpr: 1 };
   let panelRectCache = null;
   let panelRectCacheAt = 0;
@@ -683,8 +706,15 @@
   let lastTimestamp = 0;
   let obsLastFrameAt = 0;
   let activeAnimationLastFrameAt = 0;
+  let animationCadenceTargetTimestamp = 0;
+  let animationCadenceLastRafTimestamp = 0;
+  let animationCadenceRafIntervalMs = RAF_CADENCE_LEAD_MS;
+  let scheduledTickMinDelayMs = 0;
+  let scheduledTickReason = "startup";
+  let scheduledTickTargetTimestamp = 0;
   let tickRafId = 0;
   let tickTimerId = 0;
+  let lastRuntimeActivityAt = performance.now();
   let obsPublishEnabled = false;
   let obsPresetKey = DEFAULT_OBS_PRESET;
   let obsInputPostPending = false;
@@ -784,6 +814,9 @@
   let lastFaceTrackUiUpdate = 0;
   const hairTintCache = new Map();
   const itemLayers = [];
+  let itemLayerSlotRevision = 0;
+  let itemLayerSlotCacheRevision = -1;
+  const itemLayerSlotCache = new Map();
   let itemMutationChain = Promise.resolve();
   let itemMutationActive = false;
   let characterProfileDbPromise = null;
@@ -812,6 +845,466 @@
 
   function lerp(a, b, t) {
     return a + (b - a) * t;
+  }
+
+  function frameIndependentLerpFactor(perFrameFactor, delta, baseFps = 60) {
+    const factor = clamp(perFrameFactor, 0, 1);
+    const frames = Math.max(0, Number(delta) || 0) * baseFps;
+    return 1 - Math.pow(1 - factor, frames);
+  }
+
+  function perfUrlFlagEnabled() {
+    try {
+      return /(?:[?&#](?:pptPerf|purupuruPerf)(?:=1|=true)?)(?:[&#]|$)/i.test(
+        `${window.location.search}${window.location.hash}`,
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function readPerfEnabled() {
+    if (perfUrlFlagEnabled()) return true;
+    try {
+      const stored = localStorage.getItem(PERF_STORAGE_KEY);
+      if (stored !== null) return stored === "1" || stored === "true";
+    } catch {}
+
+    return false;
+  }
+
+  const perfState = {
+    enabled: readPerfEnabled(),
+    counters: new Map(),
+    dutyWindow: null,
+    dutyWindows: [],
+    frame: null,
+    highDutyPercent: PERF_DEFAULT_HIGH_DUTY_PERCENT,
+    lastDutyReportAt: 0,
+    lastReportAt: 0,
+    meshTotals: new Map(),
+    operations: [],
+    sectionStack: [],
+    slowFrameMs: PERF_DEFAULT_SLOW_FRAME_MS,
+    slowFrames: [],
+    totals: new Map(),
+    windowMs: PERF_DEFAULT_WINDOW_MS,
+  };
+
+  function perfStoreEnabled() {
+    try {
+      localStorage.setItem(PERF_STORAGE_KEY, perfState.enabled ? "1" : "0");
+    } catch {}
+  }
+
+  function perfAddStat(map, key, duration) {
+    const current = map.get(key) || { count: 0, max: 0, total: 0 };
+    current.count += 1;
+    current.total += duration;
+    current.max = Math.max(current.max, duration);
+    map.set(key, current);
+  }
+
+  function perfAddCounter(map, key, amount = 1) {
+    map.set(key, (map.get(key) || 0) + amount);
+  }
+
+  function perfRound(value) {
+    return Math.round(value * 10) / 10;
+  }
+
+  function perfStartSection(label) {
+    if (!perfState.enabled) return null;
+    perfState.sectionStack.push(label);
+    return performance.now();
+  }
+
+  function perfPopSection(label) {
+    const lastIndex = perfState.sectionStack.length - 1;
+    if (perfState.sectionStack[lastIndex] === label) {
+      perfState.sectionStack.pop();
+      return;
+    }
+    const index = perfState.sectionStack.lastIndexOf(label);
+    if (index >= 0) perfState.sectionStack.splice(index, 1);
+  }
+
+  function perfRecordOperation(label, duration) {
+    perfState.operations.push({
+      at: new Date().toISOString(),
+      durationMs: perfRound(duration),
+      label,
+    });
+    if (perfState.operations.length > PERF_MAX_OPERATIONS) perfState.operations.shift();
+  }
+
+  function perfEndSection(label, start) {
+    if (!perfState.enabled || start === null) return 0;
+    const duration = performance.now() - start;
+    perfPopSection(label);
+    const frame = perfState.frame;
+    if (frame) {
+      frame.sections[label] = (frame.sections[label] || 0) + duration;
+    } else {
+      perfRecordOperation(label, duration);
+    }
+    perfAddStat(perfState.totals, label, duration);
+    return duration;
+  }
+
+  function perfRecordAsyncDuration(label, start) {
+    if (!perfState.enabled || start === null) return 0;
+    const duration = performance.now() - start;
+    perfRecordOperation(label, duration);
+    perfAddStat(perfState.totals, label, duration);
+    return duration;
+  }
+
+  function perfRecordCounter(label, amount = 1) {
+    if (!perfState.enabled || !label) return;
+    const value = Number(amount);
+    if (!Number.isFinite(value) || value <= 0) return;
+    const frame = perfState.frame;
+    if (frame) perfAddCounter(frame.counters, label, value);
+    perfAddCounter(perfState.counters, label, value);
+  }
+
+  function perfRecordSchedulerRequest(label, reason) {
+    perfRecordCounter(label);
+    perfRecordCounter(`scheduler.reason.${reason}`);
+  }
+
+  function perfSchedulerPendingSummary() {
+    const hasRaf = Boolean(tickRafId);
+    const hasTimer = Boolean(tickTimerId);
+    return {
+      hasRaf,
+      hasTimer,
+      reason: hasRaf || hasTimer ? scheduledTickReason : null,
+    };
+  }
+
+  function perfBeginFrame(timestamp, delta) {
+    if (!perfState.enabled) return;
+    perfState.frame = {
+      counters: new Map(),
+      deltaMs: delta * 1000,
+      mesh: {
+        canvas2d: { count: 0, max: 0, total: 0 },
+        webgl: { count: 0, max: 0, total: 0 },
+        webgpu: { count: 0, max: 0, total: 0 },
+      },
+      meshTotals: new Map(),
+      sections: Object.create(null),
+      startedAt: performance.now(),
+      timestamp,
+    };
+  }
+
+  function perfCreateDutyWindow(startedAt = performance.now()) {
+    return {
+      busyMs: 0,
+      counters: new Map(),
+      deltaMs: 0,
+      frames: 0,
+      maxFrameMs: 0,
+      mesh: {
+        canvas2d: { count: 0, max: 0, total: 0 },
+        webgl: { count: 0, max: 0, total: 0 },
+        webgpu: { count: 0, max: 0, total: 0 },
+      },
+      meshTotals: new Map(),
+      sections: new Map(),
+      slowFrames: 0,
+      startedAt,
+    };
+  }
+
+  function perfTopEntries(entries, limit = 8) {
+    return entries
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit)
+      .map(([label, duration]) => `${label} ${perfRound(duration)}ms`);
+  }
+
+  function perfFrameSummary(frame) {
+    return {
+      counters: perfCounterSummary(frame.counters, 12),
+      deltaMs: perfRound(frame.deltaMs),
+      durationMs: perfRound(frame.durationMs),
+      itemLayers: itemLayers.length,
+      mesh: {
+        canvas2d: {
+          count: frame.mesh.canvas2d.count,
+          maxMs: perfRound(frame.mesh.canvas2d.max),
+          totalMs: perfRound(frame.mesh.canvas2d.total),
+        },
+        webgl: {
+          count: frame.mesh.webgl.count,
+          maxMs: perfRound(frame.mesh.webgl.max),
+          totalMs: perfRound(frame.mesh.webgl.total),
+        },
+        webgpu: {
+          count: frame.mesh.webgpu.count,
+          maxMs: perfRound(frame.mesh.webgpu.max),
+          totalMs: perfRound(frame.mesh.webgpu.total),
+        },
+      },
+      meshTotals: perfMapSummary(frame.meshTotals, 8),
+      obsMode: OBS_MODE,
+      rendererKind: activeRendererKind,
+      sections: perfTopEntries(Object.entries(frame.sections)),
+      stage: `${stage.w}x${stage.h}@${stage.dpr}`,
+      timestamp: Math.round(frame.timestamp),
+    };
+  }
+
+  function perfMaybeReportSlowFrame(frame) {
+    if (frame.durationMs < perfState.slowFrameMs) return;
+    const summary = perfFrameSummary(frame);
+    perfState.slowFrames.push(summary);
+    if (perfState.slowFrames.length > PERF_MAX_SLOW_FRAMES) perfState.slowFrames.shift();
+    const now = performance.now();
+    if (now - perfState.lastReportAt < 1000 && frame.durationMs < perfState.slowFrameMs * 2) {
+      return;
+    }
+    perfState.lastReportAt = now;
+    console.warn("[purupuru:perf] slow frame", summary);
+  }
+
+  function perfDutyWindowSummary(dutyWindow, endedAt = performance.now()) {
+    const wallMs = Math.max(1, endedAt - dutyWindow.startedAt);
+    const meshTotalMs =
+      dutyWindow.mesh.canvas2d.total + dutyWindow.mesh.webgl.total + dutyWindow.mesh.webgpu.total;
+    const meshCalls =
+      dutyWindow.mesh.canvas2d.count + dutyWindow.mesh.webgl.count + dutyWindow.mesh.webgpu.count;
+    const renderMs = dutyWindow.sections.get("tick.render")?.total || 0;
+    const nonRenderMs = Math.max(0, dutyWindow.busyMs - renderMs);
+    return {
+      activeAnimationFps: activeAnimationFps(),
+      avgFrameMs: perfRound(dutyWindow.busyMs / Math.max(1, dutyWindow.frames)),
+      busyMs: perfRound(dutyWindow.busyMs),
+      busyPercent: perfRound((dutyWindow.busyMs / wallMs) * 100),
+      counters: perfCounterSummary(dutyWindow.counters, 16),
+      deltaMs: perfRound(dutyWindow.deltaMs),
+      documentHidden: document.hidden,
+      fps: perfRound((dutyWindow.frames / wallMs) * 1000),
+      frames: dutyWindow.frames,
+      maxFrameMs: perfRound(dutyWindow.maxFrameMs),
+      mesh: {
+        canvas2d: {
+          count: dutyWindow.mesh.canvas2d.count,
+          maxMs: perfRound(dutyWindow.mesh.canvas2d.max),
+          totalMs: perfRound(dutyWindow.mesh.canvas2d.total),
+        },
+        webgl: {
+          count: dutyWindow.mesh.webgl.count,
+          maxMs: perfRound(dutyWindow.mesh.webgl.max),
+          totalMs: perfRound(dutyWindow.mesh.webgl.total),
+        },
+        webgpu: {
+          count: dutyWindow.mesh.webgpu.count,
+          maxMs: perfRound(dutyWindow.mesh.webgpu.max),
+          totalMs: perfRound(dutyWindow.mesh.webgpu.total),
+        },
+      },
+      meshCallsPerSecond: perfRound((meshCalls / wallMs) * 1000),
+      meshDutyPercent: perfRound((meshTotalMs / wallMs) * 100),
+      meshTotals: perfMapSummary(dutyWindow.meshTotals, 8),
+      nonRenderDutyPercent: perfRound((nonRenderMs / wallMs) * 100),
+      nonRenderMs: perfRound(nonRenderMs),
+      obsMode: OBS_MODE,
+      obsRenderFps: OBS_MODE ? currentObsRenderFps() : null,
+      renderDutyPercent: perfRound((renderMs / wallMs) * 100),
+      renderMs: perfRound(renderMs),
+      rendererKind: activeRendererKind,
+      sections: perfMapSummary(dutyWindow.sections, 8),
+      slowFrames: dutyWindow.slowFrames,
+      stage: `${stage.w}x${stage.h}@${stage.dpr}`,
+      wallMs: perfRound(wallMs),
+    };
+  }
+
+  function perfMaybeReportDutyWindow(summary) {
+    if (summary.busyPercent < perfState.highDutyPercent) return;
+    const now = performance.now();
+    if (now - perfState.lastDutyReportAt < perfState.windowMs) return;
+    perfState.lastDutyReportAt = now;
+    console.warn("[purupuru:perf] high CPU window", summary);
+  }
+
+  function perfRecordDutyFrame(frame) {
+    const now = performance.now();
+    if (!perfState.dutyWindow) perfState.dutyWindow = perfCreateDutyWindow(frame.startedAt);
+    const dutyWindow = perfState.dutyWindow;
+    dutyWindow.frames += 1;
+    dutyWindow.busyMs += frame.durationMs;
+    dutyWindow.deltaMs += frame.deltaMs;
+    dutyWindow.maxFrameMs = Math.max(dutyWindow.maxFrameMs, frame.durationMs);
+    if (frame.durationMs >= perfState.slowFrameMs) dutyWindow.slowFrames += 1;
+    for (const [label, duration] of Object.entries(frame.sections)) {
+      perfAddStat(dutyWindow.sections, label, duration);
+    }
+    for (const engine of ["canvas2d", "webgl", "webgpu"]) {
+      const source = frame.mesh[engine];
+      const target = dutyWindow.mesh[engine];
+      target.count += source.count;
+      target.total += source.total;
+      target.max = Math.max(target.max, source.max);
+    }
+    for (const [label, stat] of frame.meshTotals.entries()) {
+      const current = dutyWindow.meshTotals.get(label) || { count: 0, max: 0, total: 0 };
+      current.count += stat.count;
+      current.total += stat.total;
+      current.max = Math.max(current.max, stat.max);
+      dutyWindow.meshTotals.set(label, current);
+    }
+    for (const [label, count] of frame.counters.entries()) {
+      perfAddCounter(dutyWindow.counters, label, count);
+    }
+    if (now - dutyWindow.startedAt < perfState.windowMs) return;
+    const summary = perfDutyWindowSummary(dutyWindow, now);
+    perfState.dutyWindows.push(summary);
+    if (perfState.dutyWindows.length > PERF_MAX_DUTY_WINDOWS) perfState.dutyWindows.shift();
+    perfMaybeReportDutyWindow(summary);
+    perfState.dutyWindow = perfCreateDutyWindow(now);
+  }
+
+  function perfEndFrame() {
+    if (!perfState.enabled || !perfState.frame) return;
+    const frame = perfState.frame;
+    frame.durationMs = performance.now() - frame.startedAt;
+    perfMaybeReportSlowFrame(frame);
+    perfRecordDutyFrame(frame);
+    perfState.frame = null;
+    perfState.sectionStack.length = 0;
+  }
+
+  function perfRecordMesh(engine, label, duration) {
+    if (!perfState.enabled || duration <= 0) return;
+    const frame = perfState.frame;
+    if (frame?.mesh?.[engine]) {
+      const bucket = frame.mesh[engine];
+      bucket.count += 1;
+      bucket.total += duration;
+      bucket.max = Math.max(bucket.max, duration);
+      perfAddStat(frame.meshTotals, label, duration);
+    }
+    perfAddStat(perfState.meshTotals, label, duration);
+  }
+
+  function perfRecordGpuMesh(label, duration) {
+    perfRecordMesh("webgpu", label, duration);
+  }
+
+  function perfMapSummary(map, limit = 16) {
+    return [...map.entries()]
+      .map(([label, stat]) => ({
+        avgMs: perfRound(stat.total / Math.max(1, stat.count)),
+        count: stat.count,
+        label,
+        maxMs: perfRound(stat.max),
+        totalMs: perfRound(stat.total),
+      }))
+      .sort((a, b) => b.totalMs - a.totalMs)
+      .slice(0, limit);
+  }
+
+  function perfCounterSummary(map, limit = 16) {
+    return [...map.entries()]
+      .map(([label, count]) => ({
+        count: perfRound(count),
+        label,
+      }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, limit);
+  }
+
+  function perfSummary() {
+    const summary = {
+      activeAnimationFps: activeAnimationFps(),
+      activeAnimationFrameDelayMs: perfRound(activeAnimationFrameDelayMs()),
+      counters: perfCounterSummary(perfState.counters),
+      dutyWindow: perfState.dutyWindow ? perfDutyWindowSummary(perfState.dutyWindow) : null,
+      dutyWindows: perfState.dutyWindows.slice(-6),
+      enabled: perfState.enabled,
+      highDutyPercent: perfState.highDutyPercent,
+      meshTotals: perfMapSummary(perfState.meshTotals),
+      operations: perfState.operations.slice(-20),
+      profilerVersion: PERF_PROFILER_VERSION,
+      schedulerPending: perfSchedulerPendingSummary(),
+      schedulerVersion: ANIMATION_SCHEDULER_VERSION,
+      slowFrameMs: perfState.slowFrameMs,
+      slowFrames: perfState.slowFrames.slice(-12),
+      totals: perfMapSummary(perfState.totals),
+      windowMs: perfState.windowMs,
+    };
+    console.info("[purupuru:perf] summary", summary);
+    return summary;
+  }
+
+  function perfReset() {
+    perfState.counters.clear();
+    perfState.dutyWindow = null;
+    perfState.dutyWindows.length = 0;
+    perfState.frame = null;
+    perfState.lastDutyReportAt = 0;
+    perfState.lastReportAt = 0;
+    perfState.meshTotals.clear();
+    perfState.operations.length = 0;
+    perfState.sectionStack.length = 0;
+    perfState.slowFrames.length = 0;
+    perfState.totals.clear();
+  }
+
+  const purupuruPerfApi = {
+    disable() {
+      perfState.enabled = false;
+      perfStoreEnabled();
+      perfReset();
+      console.info("[purupuru:perf] disabled");
+    },
+    enable() {
+      perfReset();
+      perfState.enabled = true;
+      perfStoreEnabled();
+      console.info("[purupuru:perf] enabled", {
+        highDutyPercent: perfState.highDutyPercent,
+        slowFrameMs: perfState.slowFrameMs,
+        windowMs: perfState.windowMs,
+      });
+    },
+    reset() {
+      perfReset();
+      console.info("[purupuru:perf] reset");
+    },
+    setHighDutyPercent(value) {
+      const percent = Number(value);
+      if (Number.isFinite(percent) && percent > 0) perfState.highDutyPercent = percent;
+      return perfState.highDutyPercent;
+    },
+    setSlowFrameMs(value) {
+      const ms = Number(value);
+      if (Number.isFinite(ms) && ms > 0) perfState.slowFrameMs = ms;
+      return perfState.slowFrameMs;
+    },
+    setWindowMs(value) {
+      const ms = Number(value);
+      if (Number.isFinite(ms) && ms >= 1000) perfState.windowMs = ms;
+      return perfState.windowMs;
+    },
+    summary: perfSummary,
+  };
+
+  window.__purupuruPerf = purupuruPerfApi;
+  window.purupuruPerf = purupuruPerfApi;
+
+  if (perfState.enabled) {
+    console.info("[purupuru:perf] enabled", {
+      highDutyPercent: perfState.highDutyPercent,
+      slowFrameMs: perfState.slowFrameMs,
+      windowMs: perfState.windowMs,
+    });
   }
 
   function setupModeActive() {
@@ -993,18 +1486,39 @@
     return true;
   }
 
-  function sanitizeImportedJsonValue(value, depth = 0) {
+  function sanitizeImportedJsonValue(value, depth = 0, budget = null, options = {}) {
+    const counter = budget || { nodes: 0 };
+    const maxDataUrlStringLength =
+      Number(options.maxDataUrlStringLength) || MAX_JSON_DATA_URL_STRING_LENGTH;
+    counter.nodes += 1;
+    if (counter.nodes > MAX_JSON_NODE_COUNT) {
+      throw new Error("設定ファイルの要素数が多すぎます。");
+    }
     if (depth > MAX_JSON_SANITIZE_DEPTH) {
       throw new Error("設定ファイルの階層が深すぎます。");
     }
+    if (typeof value === "string") {
+      const limit = value.startsWith(PNG_DATA_URL_PREFIX)
+        ? maxDataUrlStringLength
+        : MAX_JSON_STRING_LENGTH;
+      if (value.length > limit) throw new Error("設定ファイル内の文字列が長すぎます。");
+      return value;
+    }
     if (Array.isArray(value)) {
-      return value.map((item) => sanitizeImportedJsonValue(item, depth + 1));
+      if (value.length > MAX_JSON_ARRAY_LENGTH) {
+        throw new Error("設定ファイル内の配列が長すぎます。");
+      }
+      return value.map((item) => sanitizeImportedJsonValue(item, depth + 1, counter, options));
     }
     if (value && typeof value === "object") {
+      const entries = Object.entries(value);
+      if (entries.length > MAX_JSON_KEYS_PER_OBJECT) {
+        throw new Error("設定ファイル内の項目数が多すぎます。");
+      }
       const sanitized = Object.create(null);
-      for (const [key, child] of Object.entries(value)) {
+      for (const [key, child] of entries) {
         if (FORBIDDEN_JSON_KEYS.has(key)) continue;
-        sanitized[key] = sanitizeImportedJsonValue(child, depth + 1);
+        sanitized[key] = sanitizeImportedJsonValue(child, depth + 1, counter, options);
       }
       return sanitized;
     }
@@ -1493,6 +2007,11 @@
         reject(new Error("PNG変換する画像サイズが不正です。"));
         return;
       }
+      const originalBlob = originalPngBlobForImage(image, width, height);
+      if (originalBlob) {
+        resolve(originalBlob);
+        return;
+      }
       const c = document.createElement("canvas");
       c.width = width;
       c.height = height;
@@ -1511,6 +2030,22 @@
         resolve(blob);
       }, "image/png");
     });
+  }
+
+  function attachOriginalPngBlob(image, blob) {
+    if (!image || !blob || blob.type !== "image/png") return image;
+    image.__purupuruOriginalPngBlob = blob;
+    image.__purupuruOriginalPngWidth = image.naturalWidth || image.width || 0;
+    image.__purupuruOriginalPngHeight = image.naturalHeight || image.height || 0;
+    return image;
+  }
+
+  function originalPngBlobForImage(image, width, height) {
+    const blob = image?.__purupuruOriginalPngBlob;
+    if (!blob || blob.type !== "image/png") return null;
+    if (image.__purupuruOriginalPngWidth !== width) return null;
+    if (image.__purupuruOriginalPngHeight !== height) return null;
+    return blob;
   }
 
   async function blobToU8(blob) {
@@ -1590,6 +2125,35 @@
     }
   }
 
+  function pngU8Dimensions(u8, name = "PNG") {
+    assertPngU8(u8, name);
+    if (u8.length < 24) throw new Error(`${name} はPNGではありません。`);
+    if (u8[12] !== 0x49 || u8[13] !== 0x48 || u8[14] !== 0x44 || u8[15] !== 0x52) {
+      throw new Error(`${name} はPNGではありません。`);
+    }
+    const w = u8[16] * 0x1000000 + (u8[17] << 16) + (u8[18] << 8) + u8[19];
+    const h = u8[20] * 0x1000000 + (u8[21] << 16) + (u8[22] << 8) + u8[23];
+    return { w, h };
+  }
+
+  function validateAvatarImageSize(size, key = "キャラ素材") {
+    const w = Math.round(Number(size?.w) || 0);
+    const h = Math.round(Number(size?.h) || 0);
+    if (
+      w <= 0 ||
+      h <= 0 ||
+      w > MAX_AVATAR_IMAGE_EDGE ||
+      h > MAX_AVATAR_IMAGE_EDGE ||
+      w * h > MAX_AVATAR_IMAGE_PIXELS
+    ) {
+      const maxPixelsText = `${Math.floor(MAX_AVATAR_IMAGE_PIXELS / 10000)}万`;
+      throw new Error(
+        `${key} は画像サイズが大きすぎます。長辺${MAX_AVATAR_IMAGE_EDGE}px以内・合計${maxPixelsText}画素以内のPNGを選んでください。`,
+      );
+    }
+    return { w, h };
+  }
+
   function resolveSettingsAssetUrl(path, settingsUrl = DEFAULT_SETTINGS_URL) {
     return new URL(String(path || ""), new URL(settingsUrl, window.location.href)).href;
   }
@@ -1633,7 +2197,7 @@
   function loadPngImageFromU8(u8, name = "PNG") {
     return new Promise((resolve, reject) => {
       try {
-        assertPngU8(u8, name);
+        validateAvatarImageSize(pngU8Dimensions(u8, name), name);
       } catch (error) {
         reject(error);
         return;
@@ -1643,6 +2207,7 @@
       const image = new Image();
       image.onload = () => {
         URL.revokeObjectURL(url);
+        attachOriginalPngBlob(image, blob);
         resolve(image);
       };
       image.onerror = () => {
@@ -1660,10 +2225,7 @@
   }
 
   function validateAvatarImageDimensions(image, key = "キャラ素材", expectedSize = null) {
-    const size = avatarImageDimensions(image);
-    if (size.w <= 0 || size.h <= 0) {
-      throw new Error(`${key} の画像サイズが不正です: ${size.w}x${size.h}`);
-    }
+    const size = validateAvatarImageSize(avatarImageDimensions(image), key);
     if (expectedSize && (size.w !== expectedSize.w || size.h !== expectedSize.h)) {
       throw new Error(`${key} のサイズが他のキャラ素材と一致しません。期待: ${expectedSize.w}x${expectedSize.h} / 実際: ${size.w}x${size.h}`);
     }
@@ -1723,55 +2285,70 @@
     faceDepthAnchorsCacheFrame = -1;
     faceRigMetricsCacheFrame = -1;
     neckPivotCacheFrame = -1;
+    frontHairShadowCompositeFrame = -1;
     return true;
   }
 
+  function invalidateFrontHairShadowComposite() {
+    frontHairShadowCompositeFrame = -1;
+  }
+
+  function invalidateItemLayerShadowComposite() {
+    invalidateFrontHairShadowComposite();
+  }
+
   async function resetMeshRendererAfterAvatarImageChange() {
+    const perf = perfStartSection("mesh.renderer.recreate");
     const generation = meshRendererGeneration + 1;
     meshRendererGeneration = generation;
+    invalidateFrontHairShadowComposite();
     try {
-      meshRenderer?.dispose?.();
-    } catch (error) {
-      console.warn("meshRenderer dispose failed", error);
-    }
-    meshRenderer = null;
-    activeRendererKind = "canvas";
-    setStageArtVisible(false);
-    syncRendererModeUi();
-
-    if (rendererModeAllowsWebGpu()) {
       try {
-        const renderer = await createWebGpuMeshRenderer(CROP.w, CROP.h);
-        if (generation !== meshRendererGeneration) {
-          renderer?.dispose?.();
-          return;
-        }
-        if (renderer) {
-          meshRenderer = renderer;
-          activeRendererKind = "webgpu";
-          setStageArtVisible(true);
-          syncRendererModeUi();
-          return;
-        }
+        meshRenderer?.dispose?.();
       } catch (error) {
-        if (rendererMode === "webgpu") {
-          console.warn("WebGPUメッシュ初期化に失敗したためCanvas描画で続行します。", error);
-        }
+        console.warn("meshRenderer dispose failed", error);
       }
-    }
-
-    if (generation !== meshRendererGeneration) return;
-    try {
-      meshRenderer = createMeshRenderer(CROP.w, CROP.h);
-      activeRendererKind = "canvas";
-      setStageArtVisible(false);
-    } catch (error) {
-      console.warn("WebGLメッシュ初期化に失敗したためCanvas描画で続行します。", error);
       meshRenderer = null;
       activeRendererKind = "canvas";
       setStageArtVisible(false);
+      syncRendererModeUi();
+
+      if (rendererModeAllowsWebGpu()) {
+        try {
+          const renderer = await createWebGpuMeshRenderer(CROP.w, CROP.h);
+          if (generation !== meshRendererGeneration) {
+            renderer?.dispose?.();
+            return;
+          }
+          if (renderer) {
+            meshRenderer = renderer;
+            activeRendererKind = "webgpu";
+            setStageArtVisible(true);
+            syncRendererModeUi();
+            return;
+          }
+        } catch (error) {
+          if (rendererMode === "webgpu") {
+            console.warn("WebGPUメッシュ初期化に失敗したためCanvas描画で続行します。", error);
+          }
+        }
+      }
+
+      if (generation !== meshRendererGeneration) return;
+      try {
+        meshRenderer = createMeshRenderer(CROP.w, CROP.h);
+        activeRendererKind = "canvas";
+        setStageArtVisible(false);
+      } catch (error) {
+        console.warn("WebGLメッシュ初期化に失敗したためCanvas描画で続行します。", error);
+        meshRenderer = null;
+        activeRendererKind = "canvas";
+        setStageArtVisible(false);
+      }
+      syncRendererModeUi();
+    } finally {
+      perfEndSection("mesh.renderer.recreate", perf);
     }
-    syncRendererModeUi();
   }
 
   function applyLoadedAvatarImages(loadedImages) {
@@ -1784,9 +2361,11 @@
     avatarPackageImageVersion += 1;
     imagesReady = true;
     loadError = "";
+    loadErrorFramePending = false;
     hairTintCache.clear();
     resetMeshRendererAfterAvatarImageChange();
     setStatus("ready");
+    noteRuntimeActivity("avatarImages.loaded");
   }
 
   async function buildPuruPuruPackagePayload() {
@@ -2073,6 +2652,7 @@
     blinkClosed = false;
     if (state.autoBlink) scheduleBlink();
     setEditStatus(loadedSettingsStatusText(statusText));
+    noteRuntimeActivity("settings.loaded");
     return true;
   }
 
@@ -2115,6 +2695,25 @@
 
   function itemSlotInfo(slotKey) {
     return ITEM_LAYER_SLOTS[slotKey] || ITEM_LAYER_SLOTS[ITEM_LAYER_DEFAULTS.slot];
+  }
+
+  function markItemLayerSlotsDirty() {
+    itemLayerSlotRevision += 1;
+    invalidateItemLayerShadowComposite();
+  }
+
+  function itemLayersForSlot(slotKey) {
+    if (itemLayerSlotCacheRevision !== itemLayerSlotRevision) {
+      itemLayerSlotCache.clear();
+      for (const layer of itemLayers) {
+        const slot = layer?.slot;
+        const bucket = itemLayerSlotCache.get(slot);
+        if (bucket) bucket.push(layer);
+        else itemLayerSlotCache.set(slot, [layer]);
+      }
+      itemLayerSlotCacheRevision = itemLayerSlotRevision;
+    }
+    return itemLayerSlotCache.get(slotKey) || EMPTY_ITEM_LAYER_LIST;
   }
 
   function imageSize(image) {
@@ -2225,6 +2824,12 @@
     return `${PNG_DATA_URL_PREFIX}${base64}`;
   }
 
+  function pngDataUrlToObjectUrl(src, name = "PNGアイテム", maxLength = Infinity) {
+    return URL.createObjectURL(
+      dataUrlToBlob(validatePngDataUrl(src, name, maxLength), "image/png"),
+    );
+  }
+
   function validateItemImageDimensions(image, name = "PNGアイテム") {
     const width = image?.naturalWidth || image?.width || 0;
     const height = image?.naturalHeight || image?.height || 0;
@@ -2319,15 +2924,16 @@
 
   function loadItemImageFromSrc(src, name = "PNGアイテム") {
     return new Promise((resolve, reject) => {
-      let normalized = "";
+      let url = "";
       try {
-        normalized = validatePngDataUrl(src, name);
+        url = pngDataUrlToObjectUrl(src, name);
       } catch (error) {
         reject(error);
         return;
       }
       const image = new Image();
       image.onload = () => {
+        URL.revokeObjectURL(url);
         try {
           validateItemImageDimensions(image, name);
           resolve(image);
@@ -2335,8 +2941,11 @@
           reject(error);
         }
       };
-      image.onerror = () => reject(new Error(`${name} を画像として読み込めませんでした。`));
-      image.src = normalized;
+      image.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error(`${name} を画像として読み込めませんでした。`));
+      };
+      image.src = url;
     });
   }
 
@@ -2354,8 +2963,10 @@
       reader.onerror = () => reject(new Error(`${file.name} を読み込めませんでした。`));
       reader.onload = () => {
         let src = "";
+        let url = "";
         try {
           src = validatePngDataUrl(reader.result, file.name);
+          url = pngDataUrlToObjectUrl(src, file.name);
         } catch (error) {
           reject(error);
           return;
@@ -2368,10 +2979,15 @@
             resolve(optimized);
           } catch (error) {
             reject(error);
+          } finally {
+            URL.revokeObjectURL(url);
           }
         };
-        image.onerror = () => reject(new Error(`${file.name} を画像として読み込めませんでした。`));
-        image.src = src;
+        image.onerror = () => {
+          URL.revokeObjectURL(url);
+          reject(new Error(`${file.name} を画像として読み込めませんでした。`));
+        };
+        image.src = url;
       };
       reader.readAsDataURL(file);
     });
@@ -2437,6 +3053,7 @@
     if (created.length) {
       activeItemLayerId = created[created.length - 1].id;
       itemHandleVisible = true;
+      markItemLayerSlotsDirty();
       const optimizeText = optimizedCount ? " 透明余白と初期サイズを自動調整しました。" : "";
       setItemStatus(`${created.length}個のPNGアイテムを追加しました。${optimizeText}.purupuru に画像込みで保存できます。`);
       updateItemLayerUi();
@@ -2565,6 +3182,7 @@
     if (!layer || layer.locked) return;
     const limit = ITEM_LAYER_LIMITS[key];
     if (limit) layer[key] = Math.round(clamp(value, limit.min, limit.max));
+    invalidateItemLayerShadowComposite();
     updateItemLayerUi({ rebuildList: false });
     markActiveCharacterDirty("settings", `item-${key}`);
   }
@@ -2576,6 +3194,7 @@
     const [layer] = itemLayers.splice(index, 1);
     const nextIndex = clamp(index + (kind === "up" ? 1 : -1), 0, itemLayers.length);
     itemLayers.splice(nextIndex, 0, layer);
+    markItemLayerSlotsDirty();
     activeItemLayerId = layer.id;
     itemHandleVisible = true;
     updateItemLayerUi();
@@ -2587,6 +3206,7 @@
     const index = itemLayers.findIndex((layer) => layer.id === id);
     if (index < 0 || itemLayers[index].locked) return;
     const [removed] = itemLayers.splice(index, 1);
+    markItemLayerSlotsDirty();
     if (removed.id === activeItemLayerId) {
       activeItemLayerId = itemLayers[Math.min(index, itemLayers.length - 1)]?.id || null;
       itemDrag = null;
@@ -2602,6 +3222,7 @@
     if (!itemLayers.length) return;
     if (!window.confirm("追加アイテムを全削除しますか？ロック中のアイテムも削除されます。")) return;
     itemLayers.length = 0;
+    markItemLayerSlotsDirty();
     activeItemLayerId = null;
     itemDrag = null;
     itemHandleVisible = false;
@@ -2629,6 +3250,7 @@
       locked: false,
     };
     itemLayers.splice(sourceIndex + 1, 0, layer);
+    markItemLayerSlotsDirty();
     nextItemLayerId += 1;
     activeItemLayerId = layer.id;
     itemHandleVisible = true;
@@ -2689,6 +3311,7 @@
 
   async function restoreItemLayersNow(inputLayers, requestedActiveId = null) {
     itemLayers.length = 0;
+    markItemLayerSlotsDirty();
     activeItemLayerId = null;
     itemDrag = null;
     itemHandleVisible = false;
@@ -2702,6 +3325,7 @@
       maxId = Math.max(maxId, layer.id);
       itemLayers.push(layer);
     });
+    markItemLayerSlotsDirty();
     const requested = Number(requestedActiveId);
     activeItemLayerId = itemLayers.some((layer) => layer.id === requested)
       ? requested
@@ -2709,6 +3333,7 @@
     itemHandleVisible = Boolean(activeItemLayerId);
     nextItemLayerId = Math.max(nextItemLayerId, maxId + 1);
     updateItemLayerUi();
+    noteRuntimeActivity("itemLayers.restore");
     const failedCount = settled.length - restored.length;
     if (failedCount > 0) {
       setItemStatus(`${failedCount}個のPNGアイテムを読み込めなかったためスキップしました。`);
@@ -2837,6 +3462,8 @@
     }
     if (obsPublishEnabled) {
       activeAnimationLastFrameAt = 0;
+      obsLastFrameAt = 0;
+      resetAnimationCadence();
       if (tickTimerId) {
         clearTimeout(tickTimerId);
         tickTimerId = 0;
@@ -2885,6 +3512,9 @@
   function setObsPublishEnabled(enabled) {
     obsPublishEnabled = Boolean(enabled);
     activeAnimationLastFrameAt = 0;
+    obsLastFrameAt = 0;
+    resetAnimationCadence();
+    noteRuntimeActivity("obs-publish");
     if (tickTimerId) {
       clearTimeout(tickTimerId);
       tickTimerId = 0;
@@ -4223,16 +4853,26 @@
   function loadImageFromDataUrl(src, name = "PNG") {
     return new Promise((resolve, reject) => {
       let normalized = "";
+      let url = "";
       try {
         normalized = validatePngDataUrl(src, name, MAX_OBS_SNAPSHOT_AVATAR_IMAGE_DATA_URL_SIZE);
+        const u8 = dataUrlToU8(normalized);
+        validateAvatarImageSize(pngU8Dimensions(u8, name), name);
+        url = URL.createObjectURL(new Blob([u8], { type: "image/png" }));
       } catch (error) {
         reject(error);
         return;
       }
       const image = new Image();
-      image.onload = () => resolve(image);
-      image.onerror = () => reject(new Error(`${name} を読み込めませんでした。`));
-      image.src = normalized;
+      image.onload = () => {
+        URL.revokeObjectURL(url);
+        resolve(image);
+      };
+      image.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error(`${name} を読み込めませんでした。`));
+      };
+      image.src = url;
     });
   }
 
@@ -4284,7 +4924,13 @@
     try {
       const response = await fetch("/api/obs/snapshot", { cache: "no-store" });
       if (!response.ok) return false;
-      const snapshot = sanitizeImportedJsonValue(await response.json());
+      const raw = await response.text();
+      if (new Blob([raw]).size > MAX_OBS_SNAPSHOT_JSON_BYTES) {
+        throw new Error("OBSスナップショットが大きすぎます。");
+      }
+      const snapshot = sanitizeImportedJsonValue(JSON.parse(raw), 0, null, {
+        maxDataUrlStringLength: MAX_OBS_SNAPSHOT_AVATAR_IMAGE_DATA_URL_SIZE,
+      });
       return await applyObsSnapshot(snapshot);
     } catch (error) {
       console.warn("OBS snapshot load failed", error);
@@ -4690,13 +5336,19 @@
       tip: { x: 760, y: 1230 },
     },
   ];
+  const HAIR_BUNDLE_DEFS_BY_LAYER = {
+    back: HAIR_BUNDLE_DEFS.filter((def) => def.layer === "back"),
+    front: HAIR_BUNDLE_DEFS.filter((def) => def.layer === "front"),
+  };
   let hairBundleRigRaw = null;
   let hairBundleRigCacheSource = undefined;
   let hairBundleRigCache = null;
+  let hairBundleRigRevision = 0;
   let hairBundleFocus = "all";
 
   function setHairBundleRigRaw(rig, { normalized = false } = {}) {
     hairBundleRigRaw = rig;
+    hairBundleRigRevision += 1;
     if (normalized && rig) {
       hairBundleRigCacheSource = rig;
       hairBundleRigCache = rig;
@@ -6135,7 +6787,13 @@
   }
 
   function setStatus(text) {
-    if (ui.statusPill) ui.statusPill.textContent = text;
+    if (ui.statusPill && ui.statusPill.textContent !== text) ui.statusPill.textContent = text;
+  }
+
+  function setLoadError(message) {
+    loadError = message instanceof Error ? message.message : String(message || "");
+    loadErrorFramePending = Boolean(loadError);
+    noteRuntimeActivity("loadError");
   }
 
   function setAudioError(message) {
@@ -6197,6 +6855,7 @@
     }
     applyRangePreviewTarget(state.rangePreviewDirection);
     updateRangePreviewButtons();
+    noteRuntimeActivity("rangePreview.change");
   }
 
   function refreshRangePreview(direction = state.rangePreviewDirection) {
@@ -6214,10 +6873,16 @@
 
   function applyFaceTrackingPose(pose) {
     if (!pose || interactionModeActive()) return;
+    perfRecordCounter("faceTracking.pose");
+    const previousX = state.targetX;
+    const previousY = state.targetY;
     const x = clamp(pose.yaw || 0, -1, 1);
     const y = clamp(pose.pitch || 0, -1, 1);
     state.targetX = x * ((x < 0 ? state.rangeLeft : state.rangeRight) / 100);
     state.targetY = y * ((y < 0 ? state.rangeUp : state.rangeDown) / 100);
+    if (Math.abs(previousX - state.targetX) > 0.0005 || Math.abs(previousY - state.targetY) > 0.0005) {
+      noteRuntimeActivity("faceTracking.pose");
+    }
 
     const now = performance.now();
     if (now - lastFaceTrackUiUpdate > 250) {
@@ -6264,7 +6929,7 @@
         return;
       }
       if (missing.length > 0) {
-        loadError = `必須素材を読み込めません: ${missing.join(", ")}`;
+        setLoadError(`必須素材を読み込めません: ${missing.join(", ")}`);
         setStatus("error");
         return;
       }
@@ -6277,7 +6942,7 @@
       }
       setStatus("ready");
     } catch (error) {
-      loadError = error instanceof Error ? error.message : String(error);
+      setLoadError(error);
       setStatus("error");
     }
   }
@@ -6304,6 +6969,8 @@
 
   function updatePointerTarget(clientX, clientY) {
     if (state.idleMotionEnabled || interactionModeActive()) return;
+    const previousX = state.targetX;
+    const previousY = state.targetY;
     const cx = stage.w * 0.5;
     const cy = stage.h * 0.48;
     const now = performance.now();
@@ -6322,6 +6989,9 @@
     const rawY = clamp((dy / verticalRange) * 1.18, -1, 1);
     state.targetX = rawX * ((rawX < 0 ? state.rangeLeft : state.rangeRight) / 100);
     state.targetY = rawY * ((rawY < 0 ? state.rangeUp : state.rangeDown) / 100);
+    if (Math.abs(previousX - state.targetX) > 0.0005 || Math.abs(previousY - state.targetY) > 0.0005) {
+      noteRuntimeActivity("pointer.target");
+    }
   }
 
   function setPreviewTarget(x, y) {
@@ -6428,6 +7098,78 @@
     const t = idleMotionEase((nowMs - idleMotionPlan.startedAt) / Math.max(1, idleMotionPlan.duration));
     state.targetX = lerp(idleMotionPlan.fromX, idleMotionPlan.toX, t);
     state.targetY = lerp(idleMotionPlan.fromY, idleMotionPlan.toY, t);
+  }
+
+  function idleMotionActiveReason(nowMs = performance.now()) {
+    if (!state.idleMotionEnabled || isFaceTrackingActive() || interactionModeActive()) return null;
+    if (!idleMotionPlan) return "idleMotion.pending";
+    if (idleMotionPlan.phase === "move") return "idleMotion.move";
+    const remainingMs = idleMotionPlan.startedAt + idleMotionPlan.duration - nowMs;
+    return remainingMs <= 0 ? "idleMotion.pending" : null;
+  }
+
+  function idleMotionHoldDelay(nowMs = performance.now()) {
+    if (!state.idleMotionEnabled || isFaceTrackingActive() || interactionModeActive()) return null;
+    if (!idleMotionPlan || idleMotionPlan.phase !== "hold") return null;
+    const remainingMs = idleMotionPlan.startedAt + idleMotionPlan.duration - nowMs;
+    if (remainingMs <= 0) return 0;
+    return Math.min(IDLE_MOTION_HOLD_MAX_DELAY_MS, Math.max(1, remainingMs));
+  }
+
+  function dragMotionReason() {
+    if (characterDrag) return "drag.character";
+    if (itemDrag) return "drag.item";
+    if (editDrag) return "drag.edit";
+    if (eyeSetupDrag) return "drag.eyeSetup";
+    if (highlightSetupDrag) return "drag.highlightSetup";
+    if (faceDepthSetupDrag) return "drag.faceDepthSetup";
+    if (neckPivotSetupDrag) return "drag.neckPivotSetup";
+    if (hairBundleSetupDrag) return "drag.hairBundleSetup";
+    return null;
+  }
+
+  function runtimeMotionReason(nowMs = performance.now()) {
+    if (!imagesReady) {
+      if (loadError) return loadErrorFramePending ? "loadErrorFrame" : null;
+      return "loading";
+    }
+    if (OBS_MODE) return "obs";
+    if (setupModeActive()) return "setup";
+    if (state.rangePreviewDirection) return "rangePreview";
+    const dragReason = dragMotionReason();
+    if (dragReason) return dragReason;
+    if (isFaceTrackingActive()) return "faceTracking";
+    if (micOn) return "voice.mic";
+    if (state.demoTalk) return "voice.demoTalk";
+    const idleReason = idleMotionActiveReason(nowMs);
+    if (idleReason) return idleReason;
+    if (blinkEvent) return "blink.event";
+    if (blinkClosed) return "blink.closed";
+    if (voiceLevel > 0.012 || mouthMotionLevel > 0.012 || jawPuniLevel > 0.012) {
+      return "voice.decay";
+    }
+    if (
+      Math.abs(state.targetX - state.angleX) > 0.004 ||
+      Math.abs(state.targetY - state.angleY) > 0.004
+    ) {
+      return "angle.settling";
+    }
+    if (obsPublishEnabled) return "obsPublish";
+    return nowMs - lastRuntimeActivityAt < RECENT_ACTIVITY_MS ? "recentActivity" : null;
+  }
+
+  function runtimeAmbientMotionReason() {
+    if (!imagesReady || OBS_MODE) return null;
+    if (interactionModeActive() || isFaceTrackingActive()) return null;
+    if (Number(state.breathStrength) > 0) return "ambient.breath";
+    if (Number(state.rollStrength) > 0) return "ambient.roll";
+    if (state.highlightEnabled && Number(state.highlightFilmWobble) > 0) return "ambient.highlightFilm";
+    if (state.subHighlightEnabled && Number(state.subHighlightFilmWobble) > 0) return "ambient.subHighlightFilm";
+    if (state.tearLensEnabled && Number(state.tearLensStrength) > 0) return "ambient.tearLens";
+    if (!state.hairVisible) return null;
+    if (hairWarpAmount() > 0.001) return "ambient.hairWarp";
+    if (Number(state.hairSpring) > 0.001) return "ambient.hairSpring";
+    return hairBundleStrengthAmount() > 0.001 ? "ambient.hairBundle" : null;
   }
 
   function affineFromTriangles(src, dst) {
@@ -6999,14 +7741,13 @@
         return vec4f(0.0);
       }
       let root = def0.xy;
-      let tip = def0.zw;
-      let v = tip - root;
-      let len2 = dot(v, v);
-      if (len2 < 1.0) {
+      let v = def0.zw;
+      let invLen2 = def1.x;
+      if (invLen2 <= 0.0) {
         return vec4f(0.0);
       }
-      let len = sqrt(len2);
-      let t = clamp(dot(source - root, v) / len2, 0.0, 1.0);
+      let sourceFromRoot = source - root;
+      let t = clamp(dot(sourceFromRoot, v) * invLen2, 0.0, 1.0);
       let closest = root + v * t;
       let dist = length(source - closest);
       let width = def1.y * (0.72 + t * 0.38);
@@ -7014,7 +7755,7 @@
       if (distanceWeight <= 0.001) {
         return vec4f(0.0);
       }
-      let rootDistance = clamp(length(source - root) / max(1.0, len), 0.0, 1.25);
+      let rootDistance = clamp(length(sourceFromRoot) * def1.w, 0.0, 1.25);
       let tipWeight = smoothstep(0.12, 1.02, t * 0.78 + rootDistance * 0.22);
       let weight = distanceWeight * (0.28 + tipWeight * 0.72);
       return vec4f(t, tipWeight, weight, 1.0);
@@ -7069,6 +7810,9 @@
       var tipTotal = 0.0;
       var mixSample = emptyHairSpringSample();
       for (var i = 0u; i < ${HAIR_BUNDLE_DEFS.length}u; i = i + 1u) {
+        if (f32(i) >= hair.p[0].w) {
+          break;
+        }
         let influence = hairBundleInfluence(source, i);
         if (influence.w <= 0.0) {
           continue;
@@ -7654,11 +8398,6 @@
     const resources = await getMeshGpuResources();
     if (!resources || resources.lost) return null;
 
-    const meshCanvas = document.createElement("canvas");
-    meshCanvas.width = width;
-    meshCanvas.height = height;
-    const context = meshCanvas.getContext("webgpu");
-    if (!context) return null;
     const stageContext = stageArtCanvas.getContext("webgpu");
     if (!stageContext) return null;
     const {
@@ -7681,7 +8420,6 @@
       stageHighlightSourcePipeline,
       stageQuadPipeline,
     } = resources;
-    context.configure({ device, format, alphaMode: "premultiplied" });
     stageContext.configure({ device, format, alphaMode: "premultiplied" });
 
     const uniformBuffer = device.createBuffer({
@@ -7689,10 +8427,13 @@
       usage: MESH_GPU_BUFFER_USAGE_UNIFORM | MESH_GPU_BUFFER_USAGE_COPY_DST,
     });
     const meshUniformValues = new Float32Array(12);
+    const lastMeshUniformValues = new Float32Array(12);
+    let meshUniformValuesUploaded = false;
+    const localIdentityTransform = new Float32Array([1, 0, 0, 0, 1, 0]);
     const writeMeshUniforms = (
       stageWidth = width,
       stageHeight = height,
-      transform = [1, 0, 0, 0, 1, 0],
+      transform = localIdentityTransform,
       alpha = 1,
     ) => {
       meshUniformValues[0] = width;
@@ -7707,7 +8448,14 @@
       meshUniformValues[9] = transform[4];
       meshUniformValues[10] = transform[5];
       meshUniformValues[11] = 0;
+      let changed = !meshUniformValuesUploaded;
+      for (let index = 0; !changed && index < meshUniformValues.length; index += 1) {
+        changed = meshUniformValues[index] !== lastMeshUniformValues[index];
+      }
+      if (!changed) return;
       device.queue.writeBuffer(uniformBuffer, 0, meshUniformValues);
+      lastMeshUniformValues.set(meshUniformValues);
+      meshUniformValuesUploaded = true;
     };
     writeMeshUniforms();
     const faceUniformBuffer = device.createBuffer({
@@ -7798,11 +8546,22 @@
         { binding: 3, resource: { buffer: shadowBlurVerticalUniformBuffer } },
       ],
     });
+    const shadowBlurHorizontalValues = new Float32Array(4);
+    const shadowBlurVerticalValues = new Float32Array(4);
+    const shadowMaskBindGroup = device.createBindGroup({
+      layout: shadowMaskPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: sampler },
+        { binding: 1, resource: shadowShapeView },
+        { binding: 2, resource: shadowReceiverView },
+      ],
+    });
     const stageUniformBuffer = device.createBuffer({
       size: 64,
       usage: MESH_GPU_BUFFER_USAGE_UNIFORM | MESH_GPU_BUFFER_USAGE_COPY_DST,
     });
     const stageUniformValues = new Float32Array(16);
+    const stageTransformScratch = new Float32Array(6);
     const stageBackgroundBindGroup = device.createBindGroup({
       layout: stageBackgroundPipeline.getBindGroupLayout(0),
       entries: [{ binding: 0, resource: { buffer: stageUniformBuffer } }],
@@ -7897,33 +8656,40 @@
     let stageWidth = Math.max(1, window.innerWidth || 1);
     let stageHeight = Math.max(1, window.innerHeight || 1);
     let stageDpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    let frameStageTextureView = null;
+    let shadowReceiverNextLoadOp = "load";
 
     const textures = new Map();
     const textureSet = new Set();
     const geometryCache = new Map();
+    let uploadedFaceControlFrame = -1;
+    let uploadedFaceControlPoints = null;
+    let uploadedFaceRootControlPoints = null;
+    let uploadedFaceRootFrame = -1;
+    let uploadedFaceUniformFrame = -1;
+    let uploadedFaceUniforms = null;
+    let uploadedHairBundleDefBytes = 0;
+    let uploadedHairBundleDefKey = "";
+    let uploadedHairBundleSampleBytes = 0;
+    let uploadedHairBundleSampleKey = "";
+    let uploadedHairSpringKey = "";
+    let uploadedHairUniformKey = "";
     let disposed = false;
-
-    function currentTextureView() {
-      try {
-        return context.getCurrentTexture().createView();
-      } catch (error) {
-        if (!(error instanceof DOMException) || error.name !== "InvalidStateError") throw error;
-        context.configure({ device, format, alphaMode: "premultiplied" });
-        return context.getCurrentTexture().createView();
-      }
-    }
 
     function configureStageContext() {
       stageContext.configure({ device, format, alphaMode: "premultiplied" });
     }
 
     function stageCurrentTextureView() {
+      if (frameStageTextureView) return frameStageTextureView;
       try {
-        return stageContext.getCurrentTexture().createView();
+        frameStageTextureView = stageContext.getCurrentTexture().createView();
+        return frameStageTextureView;
       } catch (error) {
         if (!(error instanceof DOMException) || error.name !== "InvalidStateError") throw error;
         configureStageContext();
-        return stageContext.getCurrentTexture().createView();
+        frameStageTextureView = stageContext.getCurrentTexture().createView();
+        return frameStageTextureView;
       }
     }
 
@@ -7950,6 +8716,7 @@
       const cached = geometryCache.get(cacheKey);
       if (cached) return cached;
 
+      const perf = perfStartSection("mesh.webgpu.geometry");
       const pointCount = (cols + 1) * (rows + 1);
       const vertexCount = cols * rows * 6;
       const gridX = new Float32Array(pointCount);
@@ -8006,6 +8773,7 @@
         vertexCount,
       };
       geometryCache.set(cacheKey, geometry);
+      perfEndSection("mesh.webgpu.geometry", perf);
       return geometry;
     }
 
@@ -8024,6 +8792,7 @@
         destroyTextureEntry(entry);
         entry = null;
       }
+      const perf = perfStartSection("mesh.webgpu.textureUpload");
       if (!entry) {
         const texture = device.createTexture({
           size: [imgW, imgH],
@@ -8175,6 +8944,7 @@
       );
       entry.version = version;
       rememberTextureEntry(image, entry);
+      perfEndSection("mesh.webgpu.textureUpload", perf);
       return entry;
     }
 
@@ -8208,31 +8978,95 @@
       geometry,
       pipelineToUse,
       bindGroup,
+      perfLabel,
       targetView = null,
       loadOp = "clear",
     ) {
-      const encoder = device.createCommandEncoder();
-      encodeGpuPipeline(
-        encoder,
-        geometry,
-        pipelineToUse,
-        bindGroup,
-        targetView || currentTextureView(),
-        loadOp,
-      );
-      device.queue.submit([encoder.finish()]);
-      return true;
+      if (!targetView) return false;
+      const perf = perfStartSection(perfLabel);
+      try {
+        const encoder = device.createCommandEncoder();
+        encodeGpuPipeline(encoder, geometry, pipelineToUse, bindGroup, targetView, loadOp);
+        device.queue.submit([encoder.finish()]);
+        return true;
+      } finally {
+        perfRecordGpuMesh(perfLabel, perfEndSection(perfLabel, perf));
+      }
+    }
+
+    function encodeOrDrawGpuPipeline(
+      encoder,
+      geometry,
+      pipelineToUse,
+      bindGroup,
+      perfLabel,
+      targetView = null,
+      loadOp = "clear",
+    ) {
+      if (encoder) {
+        if (!targetView) return false;
+        encodeGpuPipeline(encoder, geometry, pipelineToUse, bindGroup, targetView, loadOp);
+        return true;
+      }
+      return drawGpuPipeline(geometry, pipelineToUse, bindGroup, perfLabel, targetView, loadOp);
+    }
+
+    function writeFloat32ArrayBytes(buffer, values, byteCount) {
+      const requestedSize = Number.isFinite(byteCount) ? byteCount : values.byteLength;
+      const size = Math.min(values.byteLength, Math.max(0, requestedSize));
+      if (size <= 0) return;
+      device.queue.writeBuffer(buffer, 0, values.buffer, values.byteOffset, size);
     }
 
     function writeFaceWarpBuffers(gpuWarpSpec) {
-      device.queue.writeBuffer(faceUniformBuffer, 0, gpuWarpSpec.uniforms);
-      device.queue.writeBuffer(faceControlPointBuffer, 0, gpuWarpSpec.controlPoints);
-      if (gpuWarpSpec.faceRootControlPoints) {
+      const frame = gpuWarpSpec.frame ?? motionFrameId;
+      if (uploadedFaceUniformFrame !== frame || uploadedFaceUniforms !== gpuWarpSpec.uniforms) {
+        device.queue.writeBuffer(faceUniformBuffer, 0, gpuWarpSpec.uniforms);
+        uploadedFaceUniformFrame = frame;
+        uploadedFaceUniforms = gpuWarpSpec.uniforms;
+      }
+      if (
+        uploadedFaceControlFrame !== frame ||
+        uploadedFaceControlPoints !== gpuWarpSpec.controlPoints
+      ) {
+        device.queue.writeBuffer(faceControlPointBuffer, 0, gpuWarpSpec.controlPoints);
+        uploadedFaceControlFrame = frame;
+        uploadedFaceControlPoints = gpuWarpSpec.controlPoints;
+      }
+      if (
+        gpuWarpSpec.faceRootControlPoints &&
+        (uploadedFaceRootFrame !== frame ||
+          uploadedFaceRootControlPoints !== gpuWarpSpec.faceRootControlPoints)
+      ) {
         device.queue.writeBuffer(faceRootControlPointBuffer, 0, gpuWarpSpec.faceRootControlPoints);
+        uploadedFaceRootControlPoints = gpuWarpSpec.faceRootControlPoints;
+        uploadedFaceRootFrame = frame;
       }
     }
 
     function drawGpuWarpTextureEntry(
+      textureEntry,
+      geometry,
+      gpuWarpSpec,
+      targetView = null,
+      stageDraw = false,
+      loadOp = stageDraw ? "load" : "clear",
+    ) {
+      return Boolean(
+        encodeGpuWarpTextureEntry(
+          null,
+          textureEntry,
+          geometry,
+          gpuWarpSpec,
+          targetView,
+          stageDraw,
+          loadOp,
+        ),
+      );
+    }
+
+    function encodeGpuWarpTextureEntry(
+      encoder,
       textureEntry,
       geometry,
       gpuWarpSpec,
@@ -8247,11 +9081,15 @@
       if (!hasFaceBuffers) return false;
 
       if (gpuWarpSpec.kind === "face-v1") {
+        const perf = perfStartSection("mesh.webgpu.faceWarpUniforms");
         writeFaceWarpBuffers(gpuWarpSpec);
-        return drawGpuPipeline(
+        perfEndSection("mesh.webgpu.faceWarpUniforms", perf);
+        return encodeOrDrawGpuPipeline(
+          encoder,
           geometry,
           stageDraw ? faceStagePipeline : facePipeline,
           stageDraw ? textureEntry.faceStageBindGroup : textureEntry.faceBindGroup,
+          stageDraw ? "mesh.webgpu.stageFaceWarpDraw" : "mesh.webgpu.faceWarpDraw",
           targetView,
           loadOp,
         );
@@ -8261,12 +9099,17 @@
         gpuWarpSpec.kind === "highlight-v1" &&
         gpuWarpSpec.hairUniforms?.length === MESH_HAIR_UNIFORM_VEC4_COUNT * 4
       ) {
+        const perf = perfStartSection("mesh.webgpu.highlightWarpUniforms");
         writeFaceWarpBuffers(gpuWarpSpec);
         device.queue.writeBuffer(hairUniformBuffer, 0, gpuWarpSpec.hairUniforms);
-        return drawGpuPipeline(
+        uploadedHairUniformKey = "";
+        perfEndSection("mesh.webgpu.highlightWarpUniforms", perf);
+        return encodeOrDrawGpuPipeline(
+          encoder,
           geometry,
           stageDraw ? highlightStagePipeline : highlightPipeline,
           stageDraw ? textureEntry.highlightStageBindGroup : textureEntry.highlightBindGroup,
+          stageDraw ? "mesh.webgpu.stageHighlightWarpDraw" : "mesh.webgpu.highlightWarpDraw",
           targetView,
           loadOp,
         );
@@ -8285,12 +9128,48 @@
           !isShadowHair &&
           gpuWarpSpec.hairTintEnabled &&
           Boolean(stageDraw ? textureEntry.hairTintStageBindGroup : textureEntry.hairTintBindGroup);
+        const perf = perfStartSection(
+          isShadowHair ? "mesh.webgpu.hairShadowWarpUniforms" : "mesh.webgpu.hairWarpUniforms",
+        );
         writeFaceWarpBuffers(gpuWarpSpec);
-        device.queue.writeBuffer(hairUniformBuffer, 0, gpuWarpSpec.hairUniforms);
-        device.queue.writeBuffer(hairSpringBuffer, 0, gpuWarpSpec.hairSpringSamples);
-        device.queue.writeBuffer(hairBundleDefBuffer, 0, gpuWarpSpec.hairBundleDefs);
-        device.queue.writeBuffer(hairBundleSampleBuffer, 0, gpuWarpSpec.hairBundleSamples);
-        return drawGpuPipeline(
+        if (uploadedHairUniformKey !== gpuWarpSpec.hairUniformUploadKey) {
+          device.queue.writeBuffer(hairUniformBuffer, 0, gpuWarpSpec.hairUniforms);
+          uploadedHairUniformKey = gpuWarpSpec.hairUniformUploadKey;
+        }
+        if (uploadedHairSpringKey !== gpuWarpSpec.hairSpringUploadKey) {
+          device.queue.writeBuffer(hairSpringBuffer, 0, gpuWarpSpec.hairSpringSamples);
+          uploadedHairSpringKey = gpuWarpSpec.hairSpringUploadKey;
+        }
+        if (
+          uploadedHairBundleDefKey !== gpuWarpSpec.hairBundleDefUploadKey ||
+          uploadedHairBundleDefBytes !== gpuWarpSpec.hairBundleDefBytes
+        ) {
+          writeFloat32ArrayBytes(
+            hairBundleDefBuffer,
+            gpuWarpSpec.hairBundleDefs,
+            gpuWarpSpec.hairBundleDefBytes,
+          );
+          uploadedHairBundleDefBytes = gpuWarpSpec.hairBundleDefBytes;
+          uploadedHairBundleDefKey = gpuWarpSpec.hairBundleDefUploadKey;
+        }
+        if (
+          uploadedHairBundleSampleKey !== gpuWarpSpec.hairBundleSampleUploadKey ||
+          uploadedHairBundleSampleBytes !== gpuWarpSpec.hairBundleSampleBytes
+        ) {
+          writeFloat32ArrayBytes(
+            hairBundleSampleBuffer,
+            gpuWarpSpec.hairBundleSamples,
+            gpuWarpSpec.hairBundleSampleBytes,
+          );
+          uploadedHairBundleSampleBytes = gpuWarpSpec.hairBundleSampleBytes;
+          uploadedHairBundleSampleKey = gpuWarpSpec.hairBundleSampleUploadKey;
+        }
+        perfEndSection(
+          isShadowHair ? "mesh.webgpu.hairShadowWarpUniforms" : "mesh.webgpu.hairWarpUniforms",
+          perf,
+        );
+        return encodeOrDrawGpuPipeline(
+          encoder,
           geometry,
           stageDraw
             ? isTintedHair
@@ -8310,6 +9189,15 @@
               : isTintedHair
                 ? textureEntry.hairTintBindGroup
                 : textureEntry.hairBindGroup,
+          stageDraw
+            ? isTintedHair
+              ? "mesh.webgpu.stageHairTintWarpDraw"
+              : "mesh.webgpu.stageHairWarpDraw"
+            : isShadowHair
+              ? "mesh.webgpu.hairShadowWarpDraw"
+              : isTintedHair
+                ? "mesh.webgpu.hairTintWarpDraw"
+                : "mesh.webgpu.hairWarpDraw",
           targetView,
           loadOp,
         );
@@ -8372,7 +9260,11 @@
 
     function writeStageUniform(values) {
       stageUniformValues.fill(0);
-      stageUniformValues.set(values.slice(0, stageUniformValues.length));
+      stageUniformValues.set(values.subarray ? values.subarray(0, stageUniformValues.length) : values.slice(0, stageUniformValues.length));
+      device.queue.writeBuffer(stageUniformBuffer, 0, stageUniformValues);
+    }
+
+    function writeStageUniformBuffer() {
       device.queue.writeBuffer(stageUniformBuffer, 0, stageUniformValues);
     }
 
@@ -8382,33 +9274,39 @@
       loadOp = "load",
       vertexCount = 3,
     ) {
-      const encoder = device.createCommandEncoder();
-      encodeFullscreenPass(
-        encoder,
-        pipelineToUse,
-        bindGroup,
-        stageCurrentTextureView(),
-        loadOp,
-        vertexCount,
-      );
-      device.queue.submit([encoder.finish()]);
+      const perf = perfStartSection("stage.webgpu.fullscreen");
+      try {
+        const encoder = device.createCommandEncoder();
+        encodeFullscreenPass(
+          encoder,
+          pipelineToUse,
+          bindGroup,
+          stageCurrentTextureView(),
+          loadOp,
+          vertexCount,
+        );
+        device.queue.submit([encoder.finish()]);
+      } finally {
+        perfEndSection("stage.webgpu.fullscreen", perf);
+      }
     }
 
-    function stageTransformValues(transform) {
+    function stageTransformValues(transform, target = stageTransformScratch) {
       const cos = Math.cos(transform.rotation);
       const sin = Math.sin(transform.rotation);
-      return [
-        cos * transform.scaleX,
-        -sin * transform.scaleY,
+      target[0] = cos * transform.scaleX;
+      target[1] = -sin * transform.scaleY;
+      target[2] =
         transform.anchorX -
           cos * transform.scaleX * transform.pivotX +
-          sin * transform.scaleY * transform.pivotY,
-        sin * transform.scaleX,
-        cos * transform.scaleY,
+        sin * transform.scaleY * transform.pivotY;
+      target[3] = sin * transform.scaleX;
+      target[4] = cos * transform.scaleY;
+      target[5] =
         transform.anchorY -
           sin * transform.scaleX * transform.pivotX -
-          cos * transform.scaleY * transform.pivotY,
-      ];
+        cos * transform.scaleY * transform.pivotY;
+      return target;
     }
 
     function resizeStage(nextWidth, nextHeight, nextDpr) {
@@ -8427,6 +9325,7 @@
       stageHeight = cssHeight;
       stageDpr = dpr;
       if (!changed) return;
+      frameStageTextureView = null;
       stageArtCanvas.width = pixelWidth;
       stageArtCanvas.height = pixelHeight;
       configureStageContext();
@@ -8449,6 +9348,7 @@
     }
 
     function beginStageFrame({ bgColor, transparent = false }) {
+      frameStageTextureView = null;
       if (transparent) {
         clearStageFrame();
         return;
@@ -8510,39 +9410,73 @@
       );
     }
 
-    function drawTextureQuadToTarget(
+    function writeTextureQuadUniform(
+      bindGroup,
+      corners,
+      { alpha = 1, height: targetHeight = stageHeight, width: targetWidth = stageWidth } = {},
+    ) {
+      if (!bindGroup || !corners?.every(Boolean)) return false;
+      stageUniformValues[0] = targetWidth;
+      stageUniformValues[1] = targetHeight;
+      stageUniformValues[2] = clamp(alpha, 0, 1);
+      stageUniformValues[3] = 0;
+      stageUniformValues[4] = corners[0].x;
+      stageUniformValues[5] = corners[0].y;
+      stageUniformValues[6] = corners[1].x;
+      stageUniformValues[7] = corners[1].y;
+      stageUniformValues[8] = corners[2].x;
+      stageUniformValues[9] = corners[2].y;
+      stageUniformValues[10] = corners[3].x;
+      stageUniformValues[11] = corners[3].y;
+      stageUniformValues[12] = 0;
+      stageUniformValues[13] = 0;
+      stageUniformValues[14] = 1;
+      stageUniformValues[15] = 1;
+      writeStageUniformBuffer();
+      return true;
+    }
+
+    function encodeTextureQuadToTarget(
+      encoder,
       bindGroup,
       corners,
       {
         alpha = 1,
         height: targetHeight = stageHeight,
         loadOp = "load",
-        targetView = stageCurrentTextureView(),
+        targetView = null,
         width: targetWidth = stageWidth,
       } = {},
     ) {
-      if (!bindGroup || !corners?.every(Boolean)) return;
-      writeStageUniform([
-        targetWidth,
-        targetHeight,
-        clamp(alpha, 0, 1),
-        0,
-        corners[0].x,
-        corners[0].y,
-        corners[1].x,
-        corners[1].y,
-        corners[2].x,
-        corners[2].y,
-        corners[3].x,
-        corners[3].y,
-        0,
-        0,
-        1,
-        1,
-      ]);
+      if (
+        !writeTextureQuadUniform(bindGroup, corners, {
+          alpha,
+          height: targetHeight,
+          width: targetWidth,
+        })
+      )
+        return false;
+      encodeFullscreenPass(
+        encoder,
+        stageQuadPipeline,
+        bindGroup,
+        targetView || stageCurrentTextureView(),
+        loadOp,
+        6,
+      );
+      return true;
+    }
+
+    function drawTextureQuadToTarget(bindGroup, corners, options = {}) {
+      const { label = "stage.webgpu.quad" } = options;
+      const perf = perfStartSection(label);
+      try {
       const encoder = device.createCommandEncoder();
-      encodeFullscreenPass(encoder, stageQuadPipeline, bindGroup, targetView, loadOp, 6);
+        if (!encodeTextureQuadToTarget(encoder, bindGroup, corners, options)) return;
       device.queue.submit([encoder.finish()]);
+      } finally {
+        perfEndSection(label, perf);
+      }
     }
 
     function drawQuadToTarget(image, corners, options = {}) {
@@ -8557,6 +9491,7 @@
     function drawFrontHairShadowToStage(corners, { alpha = 1 } = {}) {
       drawTextureQuadToTarget(shadowCompositeStageQuadBindGroup, corners, {
         alpha,
+        label: "frontHairShadow.webgpuStageTexture",
       });
     }
 
@@ -8575,65 +9510,80 @@
       return drawGpuWarp(image, geometry, gpuWarpSpec, stageCurrentTextureView(), true);
     }
 
-    function clearItemDeformSource() {
-      const encoder = device.createCommandEncoder();
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [
-          {
-            view: itemDeformSourceView,
-            loadOp: "clear",
-            storeOp: "store",
-            clearValue: { r: 0, g: 0, b: 0, a: 0 },
-          },
-        ],
-      });
-      pass.end();
-      device.queue.submit([encoder.finish()]);
-    }
-
-    function drawItemDeformSource(image, corners, { alpha = 1 } = {}) {
-      clearItemDeformSource();
-      drawQuadToTarget(image, corners, {
+    function encodeItemDeformSource(encoder, image, corners, { alpha = 1 } = {}) {
+      if (!image) return false;
+      return encodeTextureQuadToTarget(encoder, textureFor(image).stageQuadBindGroup, corners, {
         alpha,
         height,
+        loadOp: "clear",
         targetView: itemDeformSourceView,
         width,
       });
     }
 
-    function drawItemDeformSourceWarpedToStage(cols, rows, options = {}) {
+    function drawItemDeformLayerToStage(image, corners, cols, rows, options = {}) {
       if (!options.characterTransform) return false;
       const geometry = meshGeometry(cols, rows, width, height);
-      writeMeshUniforms(
-        stageWidth,
-        stageHeight,
-        stageTransformValues(options.characterTransform),
-        clamp(options.alpha ?? 1, 0, 1),
-      );
-      return drawGpuWarpTextureEntry(
-        itemDeformSourceEntry,
-        geometry,
-        options.gpuWarpSpec || null,
-        stageCurrentTextureView(),
-        true,
-        "load",
-      );
+      const perf = perfStartSection("itemDeform.webgpuSourceAndStageWarp");
+      try {
+        const encoder = device.createCommandEncoder();
+        if (!encodeItemDeformSource(encoder, image, corners, { alpha: options.sourceAlpha ?? 1 }))
+          return false;
+        writeMeshUniforms(
+          stageWidth,
+          stageHeight,
+          stageTransformValues(options.characterTransform),
+          clamp(options.alpha ?? 1, 0, 1),
+        );
+        if (
+          !encodeGpuWarpTextureEntry(
+            encoder,
+            itemDeformSourceEntry,
+            geometry,
+            options.gpuWarpSpec || null,
+            stageCurrentTextureView(),
+            true,
+            "load",
+          )
+        )
+          return false;
+        device.queue.submit([encoder.finish()]);
+        return true;
+      } finally {
+        perfEndSection("itemDeform.webgpuSourceAndStageWarp", perf);
+      }
     }
 
-    function drawItemDeformSourceWarpedToShadowReceiver(cols, rows, options = {}) {
+    function drawItemDeformLayerToShadowReceiver(image, corners, cols, rows, options = {}) {
       const geometry = meshGeometry(cols, rows, width, height);
-      writeMeshUniforms();
-      return drawGpuWarpTextureEntry(
-        itemDeformSourceEntry,
-        geometry,
-        options.gpuWarpSpec || null,
-        shadowReceiverView,
-        false,
-        "load",
-      );
+      const loadOp = shadowReceiverNextLoadOp;
+      shadowReceiverNextLoadOp = "load";
+      const perf = perfStartSection("itemDeform.webgpuSourceAndShadowWarp");
+      try {
+        const encoder = device.createCommandEncoder();
+        if (!encodeItemDeformSource(encoder, image, corners, { alpha: options.sourceAlpha ?? 1 }))
+          return false;
+        writeMeshUniforms();
+        if (
+          !encodeGpuWarpTextureEntry(
+            encoder,
+            itemDeformSourceEntry,
+            geometry,
+            options.gpuWarpSpec || null,
+            shadowReceiverView,
+            false,
+            loadOp,
+          )
+        )
+          return false;
+        device.queue.submit([encoder.finish()]);
+        return true;
+      } finally {
+        perfEndSection("itemDeform.webgpuSourceAndShadowWarp", perf);
+      }
     }
 
-    function drawHighlightSource(points, { alpha = 1, aspect = 1, diameter = 16 } = {}) {
+    function writeHighlightSourceUniform(points, { alpha = 1, aspect = 1, diameter = 16 } = {}) {
       const left = points?.[0];
       const right = points?.[1];
       if (!left || !right) return false;
@@ -8641,25 +9591,28 @@
       const radiusX = Math.max(0.001, radiusY * aspect);
       const leftRotation = eyeLensRotationForIndex(0);
       const rightRotation = eyeLensRotationForIndex(1);
-      writeStageUniform([
-        width,
-        height,
-        clamp(alpha, 0, 1),
-        0,
-        left.x,
-        left.y,
-        radiusX,
-        radiusY,
-        right.x,
-        right.y,
-        radiusX,
-        radiusY,
-        Math.cos(leftRotation),
-        Math.sin(leftRotation),
-        Math.cos(rightRotation),
-        Math.sin(rightRotation),
-      ]);
-      const encoder = device.createCommandEncoder();
+      stageUniformValues[0] = width;
+      stageUniformValues[1] = height;
+      stageUniformValues[2] = clamp(alpha, 0, 1);
+      stageUniformValues[3] = 0;
+      stageUniformValues[4] = left.x;
+      stageUniformValues[5] = left.y;
+      stageUniformValues[6] = radiusX;
+      stageUniformValues[7] = radiusY;
+      stageUniformValues[8] = right.x;
+      stageUniformValues[9] = right.y;
+      stageUniformValues[10] = radiusX;
+      stageUniformValues[11] = radiusY;
+      stageUniformValues[12] = Math.cos(leftRotation);
+      stageUniformValues[13] = Math.sin(leftRotation);
+      stageUniformValues[14] = Math.cos(rightRotation);
+      stageUniformValues[15] = Math.sin(rightRotation);
+      writeStageUniformBuffer();
+      return true;
+    }
+
+    function encodeHighlightSource(encoder, points, options = {}) {
+      if (!writeHighlightSourceUniform(points, options)) return false;
       encodeFullscreenPass(
         encoder,
         stageHighlightSourcePipeline,
@@ -8667,49 +9620,66 @@
         highlightSourceView,
         "clear",
       );
-      device.queue.submit([encoder.finish()]);
       return true;
     }
 
-    function drawHighlightSourceWarpedToStage(cols, rows, options = {}) {
+    function drawHighlightSource(points, options = {}) {
+      const perf = perfStartSection("highlight.webgpuSource");
+      try {
+      const encoder = device.createCommandEncoder();
+        if (!encodeHighlightSource(encoder, points, options)) return false;
+      device.queue.submit([encoder.finish()]);
+      return true;
+      } finally {
+        perfEndSection("highlight.webgpuSource", perf);
+      }
+    }
+
+    function drawHighlightSourceWarpedToStage(points, cols, rows, options = {}) {
       if (!options.characterTransform) return false;
       const geometry = meshGeometry(cols, rows, width, height);
-      writeMeshUniforms(
-        stageWidth,
-        stageHeight,
-        stageTransformValues(options.characterTransform),
-        clamp(options.alpha ?? 1, 0, 1),
-      );
-      return drawGpuWarpTextureEntry(
-        highlightSourceEntry,
-        geometry,
-        options.gpuWarpSpec || null,
-        stageCurrentTextureView(),
-        true,
-        "load",
-      );
+      const perf = perfStartSection("highlight.webgpuSourceAndWarp");
+      try {
+        const encoder = device.createCommandEncoder();
+        if (!encodeHighlightSource(encoder, points, options.sourceOptions || {})) return false;
+        writeMeshUniforms(
+          stageWidth,
+          stageHeight,
+          stageTransformValues(options.characterTransform),
+          clamp(options.alpha ?? 1, 0, 1),
+        );
+        if (
+          !encodeGpuWarpTextureEntry(
+            encoder,
+            highlightSourceEntry,
+            geometry,
+            options.gpuWarpSpec || null,
+            stageCurrentTextureView(),
+            true,
+            "load",
+          )
+        )
+          return false;
+        device.queue.submit([encoder.finish()]);
+        return true;
+      } finally {
+        perfEndSection("highlight.webgpuSourceAndWarp", perf);
+      }
     }
 
     function clearFrontHairShadowReceiver() {
-      const encoder = device.createCommandEncoder();
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [
-          {
-            view: shadowReceiverView,
-            loadOp: "clear",
-            storeOp: "store",
-            clearValue: { r: 0, g: 0, b: 0, a: 0 },
-          },
-        ],
-      });
-      pass.end();
-      device.queue.submit([encoder.finish()]);
+      shadowReceiverNextLoadOp = "clear";
     }
 
     function drawFrontHairShadowReceiverQuad(image, corners, { alpha = 1 } = {}) {
+      if (!image || !corners?.every(Boolean)) return;
+      const loadOp = shadowReceiverNextLoadOp;
+      shadowReceiverNextLoadOp = "load";
       drawQuadToTarget(image, corners, {
         alpha,
         height,
+        label: "frontHairShadow.webgpuReceiverQuad",
+        loadOp,
         targetView: shadowReceiverView,
         width,
       });
@@ -8721,8 +9691,10 @@
       const imgW = image.naturalWidth || image.width;
       const imgH = image.naturalHeight || image.height;
       const geometry = meshGeometry(cols, rows, imgW, imgH);
-      writeMeshUniforms();
-      return drawGpuWarp(image, geometry, gpuWarpSpec, shadowReceiverView, false, "load");
+      writeMeshUniforms(width, height, localIdentityTransform, clamp(options.alpha ?? 1, 0, 1));
+      const loadOp = shadowReceiverNextLoadOp;
+      shadowReceiverNextLoadOp = "load";
+      return drawGpuWarp(image, geometry, gpuWarpSpec, shadowReceiverView, false, loadOp);
     }
 
     function drawFrontHairShadowComposite(image, cols, rows, options = {}) {
@@ -8732,55 +9704,67 @@
         throw new Error("WebGPU front hair shadow draw requires a shadow hair warp spec");
       }
 
-      const imgW = image.naturalWidth || image.width;
-      const imgH = image.naturalHeight || image.height;
-      const geometry = meshGeometry(cols, rows, imgW, imgH);
-      writeMeshUniforms();
-      if (!drawGpuWarp(image, geometry, gpuWarpSpec, shadowShapeView)) {
-        throw new Error("WebGPU front hair shadow warp failed");
+      const perf = perfStartSection("frontHairShadow.webgpuComposite");
+      try {
+        const imgW = image.naturalWidth || image.width;
+        const imgH = image.naturalHeight || image.height;
+        const geometry = meshGeometry(cols, rows, imgW, imgH);
+        writeMeshUniforms();
+        const encoder = device.createCommandEncoder();
+        const warpPassPerf = perfStartSection("frontHairShadow.webgpuWarpPass");
+        const warped = encodeGpuWarpTextureEntry(
+          encoder,
+          textureFor(image),
+          geometry,
+          gpuWarpSpec,
+          shadowShapeView,
+        );
+        perfEndSection("frontHairShadow.webgpuWarpPass", warpPassPerf);
+        if (!warped) {
+          throw new Error("WebGPU front hair shadow warp failed");
+        }
+
+        const blur = Math.max(0, Number(options.blur) || 0);
+        const blurUniformPerf = perfStartSection("frontHairShadow.webgpuBlurUniforms");
+        shadowBlurHorizontalValues[0] = blur / width;
+        shadowBlurHorizontalValues[1] = 0;
+        shadowBlurHorizontalValues[2] = 0;
+        shadowBlurHorizontalValues[3] = 0;
+        shadowBlurVerticalValues[0] = 0;
+        shadowBlurVerticalValues[1] = blur / height;
+        shadowBlurVerticalValues[2] = 0;
+        shadowBlurVerticalValues[3] = 0;
+        device.queue.writeBuffer(shadowBlurHorizontalUniformBuffer, 0, shadowBlurHorizontalValues);
+        device.queue.writeBuffer(shadowBlurVerticalUniformBuffer, 0, shadowBlurVerticalValues);
+        perfEndSection("frontHairShadow.webgpuBlurUniforms", blurUniformPerf);
+
+        const blurPassPerf = perfStartSection("frontHairShadow.webgpuBlurPass");
+        encodeFullscreenPass(
+          encoder,
+          shadowBlurPipeline,
+          shadowBlurHorizontalBindGroup,
+          shadowBlurView,
+        );
+        encodeFullscreenPass(
+          encoder,
+          shadowBlurPipeline,
+          shadowBlurVerticalBindGroup,
+          shadowShapeView,
+        );
+        perfEndSection("frontHairShadow.webgpuBlurPass", blurPassPerf);
+
+        const maskPassPerf = perfStartSection("frontHairShadow.webgpuMaskPass");
+        encodeFullscreenPass(encoder, shadowMaskPipeline, shadowMaskBindGroup, shadowCompositeView);
+        perfEndSection("frontHairShadow.webgpuMaskPass", maskPassPerf);
+        device.queue.submit([encoder.finish()]);
+        return true;
+      } finally {
+        perfEndSection("frontHairShadow.webgpuComposite", perf);
       }
-      const blur = Math.max(0, Number(options.blur) || 0);
-      device.queue.writeBuffer(
-        shadowBlurHorizontalUniformBuffer,
-        0,
-        new Float32Array([blur / width, 0, 0, 0]),
-      );
-      device.queue.writeBuffer(
-        shadowBlurVerticalUniformBuffer,
-        0,
-        new Float32Array([0, blur / height, 0, 0]),
-      );
-
-      const maskBindGroup = device.createBindGroup({
-        layout: shadowMaskPipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: sampler },
-          { binding: 1, resource: shadowShapeView },
-          { binding: 2, resource: shadowReceiverView },
-        ],
-      });
-      const encoder = device.createCommandEncoder();
-      encodeFullscreenPass(
-        encoder,
-        shadowBlurPipeline,
-        shadowBlurHorizontalBindGroup,
-        shadowBlurView,
-      );
-      encodeFullscreenPass(
-        encoder,
-        shadowBlurPipeline,
-        shadowBlurVerticalBindGroup,
-        shadowShapeView,
-      );
-
-      encodeFullscreenPass(encoder, shadowMaskPipeline, maskBindGroup, shadowCompositeView);
-      device.queue.submit([encoder.finish()]);
-      return true;
     }
 
     return {
-      canvas: meshCanvas,
-      rendererKind: 'webgpu',
+      rendererKind: "webgpu",
       dispose() {
         if (disposed) return;
         disposed = true;
@@ -8810,7 +9794,6 @@
         textures.clear();
         textureSet.clear();
         geometryCache.clear();
-        context.unconfigure();
         stageContext.unconfigure();
       },
       beginStageFrame,
@@ -8819,9 +9802,8 @@
       drawFrontHairShadowReceiverQuad,
       drawFrontHairShadowReceiverWarpedImage,
       drawFrontHairShadowToStage,
-      drawItemDeformSource,
-      drawItemDeformSourceWarpedToShadowReceiver,
-      drawItemDeformSourceWarpedToStage,
+      drawItemDeformLayerToShadowReceiver,
+      drawItemDeformLayerToStage,
       drawHighlightSource,
       drawHighlightSourceWarpedToStage,
       drawStageGroundShadow,
@@ -8832,11 +9814,12 @@
       },
       draw(image, cols, rows, options = {}) {
         if (disposed || resources.lost) throw new Error("WebGPU mesh renderer is unavailable");
+        if (!options.targetView) throw new Error("WebGPU mesh draw requires a target view");
         const imgW = image.naturalWidth || image.width;
         const imgH = image.naturalHeight || image.height;
         const geometry = meshGeometry(cols, rows, imgW, imgH);
         writeMeshUniforms();
-        if (drawGpuWarp(image, geometry, options.gpuWarpSpec)) return;
+        if (drawGpuWarp(image, geometry, options.gpuWarpSpec, options.targetView)) return;
         throw new Error("WebGPU mesh draw is missing a GPU warp spec");
       },
       resizeStage,
@@ -9036,45 +10019,50 @@
         if (disposed || contextLost || gl.isContextLost?.()) {
           throw new Error("WebGL context lost");
         }
-        const imgW = image.naturalWidth || image.width;
-        const imgH = image.naturalHeight || image.height;
-        const geometry = meshGeometry(cols, rows, imgW, imgH);
-        const { gridX, gridY, dstGrid, pointIndices, positions, texcoordBuffer, vertexCount } = geometry;
+        const perf = perfStartSection("mesh.webgl.draw");
+        try {
+          const imgW = image.naturalWidth || image.width;
+          const imgH = image.naturalHeight || image.height;
+          const geometry = meshGeometry(cols, rows, imgW, imgH);
+          const { gridX, gridY, dstGrid, pointIndices, positions, texcoordBuffer, vertexCount } = geometry;
 
-        for (let i = 0; i < gridX.length; i += 1) {
-          const p = warpFn(gridX[i], gridY[i]);
-          dstGrid[i * 2] = p.x;
-          dstGrid[i * 2 + 1] = p.y;
+          for (let i = 0; i < gridX.length; i += 1) {
+            const p = warpFn(gridX[i], gridY[i]);
+            dstGrid[i * 2] = p.x;
+            dstGrid[i * 2 + 1] = p.y;
+          }
+
+          for (let i = 0; i < pointIndices.length; i += 1) {
+            const idx = pointIndices[i];
+            positions[i * 2] = dstGrid[idx * 2];
+            positions[i * 2 + 1] = dstGrid[idx * 2 + 1];
+          }
+
+          gl.viewport(0, 0, width, height);
+          gl.clearColor(0, 0, 0, 0);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          gl.useProgram(program);
+          gl.uniform2f(resolutionLocation, width, height);
+          gl.uniform1i(imageLocation, 0);
+
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, textureFor(image));
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+          gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
+          gl.enableVertexAttribArray(positionLocation);
+          gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, texcoordBuffer);
+          gl.enableVertexAttribArray(texcoordLocation);
+          gl.vertexAttribPointer(texcoordLocation, 2, gl.FLOAT, false, 0, 0);
+
+          gl.enable(gl.BLEND);
+          gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+          gl.drawArrays(gl.TRIANGLES, 0, vertexCount);
+        } finally {
+          perfRecordMesh("webgl", "mesh.webgl.draw", perfEndSection("mesh.webgl.draw", perf));
         }
-
-        for (let i = 0; i < pointIndices.length; i += 1) {
-          const idx = pointIndices[i];
-          positions[i * 2] = dstGrid[idx * 2];
-          positions[i * 2 + 1] = dstGrid[idx * 2 + 1];
-        }
-
-        gl.viewport(0, 0, width, height);
-        gl.clearColor(0, 0, 0, 0);
-        gl.clear(gl.COLOR_BUFFER_BIT);
-        gl.useProgram(program);
-        gl.uniform2f(resolutionLocation, width, height);
-        gl.uniform1i(imageLocation, 0);
-
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, textureFor(image));
-
-        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
-        gl.enableVertexAttribArray(positionLocation);
-        gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
-
-        gl.bindBuffer(gl.ARRAY_BUFFER, texcoordBuffer);
-        gl.enableVertexAttribArray(texcoordLocation);
-        gl.vertexAttribPointer(texcoordLocation, 2, gl.FLOAT, false, 0, 0);
-
-        gl.enable(gl.BLEND);
-        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-        gl.drawArrays(gl.TRIANGLES, 0, vertexCount);
       },
     };
   }
@@ -9106,6 +10094,7 @@
         meshRenderer.dispose?.();
         meshRenderer = null;
         activeRendererKind = "canvas";
+        invalidateFrontHairShadowComposite();
         if (failedRendererKind === "webgpu") {
           try {
             meshRenderer = createMeshRenderer(CROP.w, CROP.h);
@@ -9118,6 +10107,8 @@
     }
 
     // WebGLが使えない/失敗した環境ではCanvas 2Dの三角形メッシュで描く。
+    const perf = perfStartSection("mesh.canvas2d.triangleWarp");
+    try {
     const srcGrid = [];
     const dstGrid = [];
     for (let y = 0; y <= rows; y += 1) {
@@ -9141,6 +10132,13 @@
         drawTexturedTriangle(targetCtx, image, [s00, s10, s11], [d00, d10, d11]);
         drawTexturedTriangle(targetCtx, image, [s00, s11, s01], [d00, d11, d01]);
       }
+    }
+    } finally {
+      perfRecordMesh(
+        "canvas2d",
+        "mesh.canvas2d.triangleWarp",
+        perfEndSection("mesh.canvas2d.triangleWarp", perf),
+      );
     }
   }
 
@@ -10073,6 +11071,7 @@
     }
     meshRenderer = null;
     activeRendererKind = "canvas";
+    invalidateFrontHairShadowComposite();
     setStageArtVisible(false);
     try {
       meshRenderer = createMeshRenderer(CROP.w, CROP.h);
@@ -10092,6 +11091,7 @@
     meshRenderer = null;
     activeRendererKind = "canvas";
     rendererFallbackRequested = true;
+    invalidateFrontHairShadowComposite();
     setStageArtVisible(false);
     try {
       meshRenderer = createMeshRenderer(CROP.w, CROP.h);
@@ -10207,7 +11207,7 @@
   function frontHairShadowShouldRefresh() {
     if (frontHairShadowCompositeFrame < 0) return true;
     if (state.editMode || setupModeActive() || state.rangePreviewDirection) return true;
-    return motionFrameId - frontHairShadowCompositeFrame >= 2;
+    return motionFrameId - frontHairShadowCompositeFrame >= FRONT_HAIR_SHADOW_REFRESH_FRAME_INTERVAL;
   }
 
   function frontHairShadowShapeSpec(distance) {
@@ -10266,8 +11266,7 @@
     };
   }
 
-  function buildLayerGpuControlPoints(layer) {
-    const controlPoints = new Float32Array(MESH_FACE_CONTROL_POINT_COUNT * 2);
+  function buildLayerGpuControlPoints(layer, controlPoints = new Float32Array(MESH_FACE_CONTROL_POINT_COUNT * 2)) {
     let controlIndex = 0;
     for (let row = 0; row <= DEFORMER_ROWS; row += 1) {
       for (let col = 0; col <= DEFORMER_COLS; col += 1) {
@@ -10299,18 +11298,25 @@
   }
 
   function buildFaceGpuWarpSpec(includeTearLens = true, includeEyeCenters = includeTearLens) {
-    if (faceGpuWarpSpecCacheFrame !== motionFrameId || !faceGpuWarpSpecCache) {
-      faceGpuWarpSpecCacheFrame = motionFrameId;
-      faceGpuWarpSpecCache = new Map();
-    }
+    if (!faceGpuWarpSpecCache) faceGpuWarpSpecCache = new Map();
+    if (faceGpuWarpSpecCacheFrame !== motionFrameId) faceGpuWarpSpecCacheFrame = motionFrameId;
     const cacheKey = `${includeTearLens ? "tear" : "plain"}:${includeEyeCenters ? "eyes" : "no-eyes"}`;
-    const cached = faceGpuWarpSpecCache.get(cacheKey);
-    if (cached) {
-      return cached;
+    let spec = faceGpuWarpSpecCache.get(cacheKey);
+    if (spec?.frame === motionFrameId) return spec;
+    if (!spec) {
+      spec = {
+        controlPoints: new Float32Array(MESH_FACE_CONTROL_POINT_COUNT * 2),
+        frame: -1,
+        kind: "face-v1",
+        uniforms: new Float32Array(MESH_FACE_UNIFORM_VEC4_COUNT * 4),
+      };
+      faceGpuWarpSpecCache.set(cacheKey, spec);
     }
 
-    const uniforms = new Float32Array(MESH_FACE_UNIFORM_VEC4_COUNT * 4);
-    const controlPoints = buildLayerGpuControlPoints("face");
+    const perf = perfStartSection("mesh.webgpu.faceWarpSpec");
+    const uniforms = spec.uniforms;
+    uniforms.fill(0);
+    buildLayerGpuControlPoints("face", spec.controlPoints);
     const setUniform = (index, x = 0, y = 0, z = 0, w = 0) => {
       const offset = index * 4;
       uniforms[offset] = x;
@@ -10403,26 +11409,34 @@
     );
     setUniform(16, leftShimmer, rightShimmer);
 
-    const spec = {
-      controlPoints,
-      kind: "face-v1",
-      uniforms,
-    };
-    faceGpuWarpSpecCache.set(cacheKey, spec);
+    spec.frame = motionFrameId;
+    perfEndSection("mesh.webgpu.faceWarpSpec", perf);
     return spec;
   }
 
   function buildHighlightGpuWarpSpec(filmWobbleValue = state.highlightFilmWobble) {
     const cacheKey = `${filmWobbleValue}`;
-    if (highlightGpuWarpSpecCacheFrame !== motionFrameId || !highlightGpuWarpSpecCache) {
+    if (!highlightGpuWarpSpecCache) highlightGpuWarpSpecCache = new Map();
+    if (highlightGpuWarpSpecCacheFrame !== motionFrameId) {
       highlightGpuWarpSpecCacheFrame = motionFrameId;
-      highlightGpuWarpSpecCache = new Map();
     }
-    const cached = highlightGpuWarpSpecCache.get(cacheKey);
-    if (cached) return cached;
+    let spec = highlightGpuWarpSpecCache.get(cacheKey);
+    if (spec?.frame === motionFrameId) return spec;
+    if (!spec) {
+      spec = {
+        controlPoints: null,
+        frame: -1,
+        hairUniforms: new Float32Array(MESH_HAIR_UNIFORM_VEC4_COUNT * 4),
+        kind: "highlight-v1",
+        uniforms: null,
+      };
+      highlightGpuWarpSpecCache.set(cacheKey, spec);
+    }
 
+    const perf = perfStartSection("mesh.webgpu.highlightWarpSpec");
     const faceSpec = buildFaceGpuWarpSpec(false, true);
-    const hairUniforms = new Float32Array(MESH_HAIR_UNIFORM_VEC4_COUNT * 4);
+    const hairUniforms = spec.hairUniforms;
+    hairUniforms.fill(0);
     const setUniform = (index, x = 0, y = 0, z = 0, w = 0) => {
       const offset = index * 4;
       hairUniforms[offset] = x;
@@ -10445,35 +11459,56 @@
       setUniform(6, 1, 0, 0, 0);
     }
 
-    const spec = {
-      controlPoints: faceSpec.controlPoints,
-      hairUniforms,
-      kind: "highlight-v1",
-      uniforms: faceSpec.uniforms,
-    };
-    highlightGpuWarpSpecCache.set(cacheKey, spec);
+    spec.controlPoints = faceSpec.controlPoints;
+    spec.frame = motionFrameId;
+    spec.uniforms = faceSpec.uniforms;
+    perfEndSection("mesh.webgpu.highlightWarpSpec", perf);
     return spec;
   }
 
   function buildHairGpuWarpSpec(layer, shadowOffset = null) {
     const layerKey = layer === "front" ? "frontHair" : "backHair";
-    if (hairGpuWarpSpecCacheFrame !== motionFrameId || !hairGpuWarpSpecCache) {
-      hairGpuWarpSpecCacheFrame = motionFrameId;
-      hairGpuWarpSpecCache = new Map();
-    }
+    if (!hairGpuWarpSpecCache) hairGpuWarpSpecCache = new Map();
+    if (hairGpuWarpSpecCacheFrame !== motionFrameId) hairGpuWarpSpecCacheFrame = motionFrameId;
     const shadowTint = shadowOffset?.tint || null;
     const hairTint = shadowTint ? null : currentHairTintUniform();
-    const cacheKey = shadowOffset
-      ? `${layer}:shadow:${shadowOffset.offsetX}:${shadowOffset.offsetY}:${shadowTint?.join(",") || ""}`
-      : `${layer}:tint:${hairTint.signature}`;
-    const cached = hairGpuWarpSpecCache.get(cacheKey);
-    if (cached) return cached;
+    const dynamicSignature = shadowOffset
+      ? `${shadowOffset.offsetX}:${shadowOffset.offsetY}:${shadowTint?.join(",") || ""}`
+      : hairTint.signature;
+    const cacheKey = shadowTint ? `${layer}:shadow:${shadowTint.join(",")}` : `${layer}:normal`;
+    let spec = hairGpuWarpSpecCache.get(cacheKey);
+    if (spec?.frame === motionFrameId && spec.dynamicSignature === dynamicSignature) return spec;
+    if (!spec) {
+      spec = {
+        controlPoints: new Float32Array(MESH_FACE_CONTROL_POINT_COUNT * 2),
+        dynamicSignature: "",
+        faceRootControlPoints: null,
+        frame: -1,
+        hairBundleDefBytes: 0,
+        hairBundleDefUploadKey: "",
+        hairBundleDefs: new Float32Array(MESH_HAIR_BUNDLE_DEF_VEC4_COUNT * 4),
+        hairBundleSampleBytes: 0,
+        hairBundleSampleUploadKey: "",
+        hairBundleSamples: new Float32Array(MESH_HAIR_BUNDLE_SAMPLE_VEC4_COUNT * 4),
+        hairSpringSamples: new Float32Array(MESH_HAIR_SPRING_VEC4_COUNT * 4),
+        hairSpringUploadKey: "",
+        hairTintEnabled: false,
+        hairUniformUploadKey: "",
+        hairUniforms: new Float32Array(MESH_HAIR_UNIFORM_VEC4_COUNT * 4),
+        kind: shadowTint ? "hair-shadow-v1" : "hair-v1",
+        layer,
+        uniforms: null,
+      };
+      hairGpuWarpSpecCache.set(cacheKey, spec);
+    }
 
+    const perf = perfStartSection("mesh.webgpu.hairWarpSpec");
     const faceSpec = buildFaceGpuWarpSpec(false, false);
-    const hairUniforms = new Float32Array(MESH_HAIR_UNIFORM_VEC4_COUNT * 4);
-    const hairSpringSamples = new Float32Array(MESH_HAIR_SPRING_VEC4_COUNT * 4);
-    const hairBundleDefs = new Float32Array(MESH_HAIR_BUNDLE_DEF_VEC4_COUNT * 4);
-    const hairBundleSamples = new Float32Array(MESH_HAIR_BUNDLE_SAMPLE_VEC4_COUNT * 4);
+    const hairUniforms = spec.hairUniforms;
+    const hairSpringSamples = spec.hairSpringSamples;
+    const hairBundleDefs = spec.hairBundleDefs;
+    const hairBundleSamples = spec.hairBundleSamples;
+    hairUniforms.fill(0);
     const setUniform = (index, x = 0, y = 0, z = 0, w = 0) => {
       const offset = index * 4;
       hairUniforms[offset] = x;
@@ -10486,7 +11521,16 @@
     const ay = state.angleY * (state.angleStrength / 100);
     const head = computeHeadOffset();
     const isFront = layer === "front";
-    setUniform(0, CROP.w, CROP.h, isFront ? 1 : 0);
+    const activeBundleDefs = HAIR_BUNDLE_DEFS_BY_LAYER[layer] || EMPTY_ITEM_LAYER_LIST;
+    const hairBundleDefBytes = activeBundleDefs.length * 8 * Float32Array.BYTES_PER_ELEMENT;
+    const hairBundleDefUploadKey = `${layer}:${hairBundleRigRevision}`;
+    const shouldPackBundleDefs =
+      spec.hairBundleDefUploadKey !== hairBundleDefUploadKey ||
+      spec.hairBundleDefBytes !== hairBundleDefBytes;
+    spec.hairBundleDefBytes = hairBundleDefBytes;
+    spec.hairBundleSampleBytes =
+      activeBundleDefs.length * HAIR_SPRING_BUCKETS * 12 * Float32Array.BYTES_PER_ELEMENT;
+    setUniform(0, CROP.w, CROP.h, isFront ? 1 : 0, activeBundleDefs.length);
     setUniform(1, ax, ay, hairWarpAmount(), state.hairSpring / 100);
     setUniform(2, head.x, head.y, frontHairRootFollowAmount(), hairBundleStrengthAmount());
     setUniform(
@@ -10508,19 +11552,28 @@
       writeHairSpringBucket(hairSpringSamples, index * 3, spring.buckets[index]);
     }
 
-    const rig = currentHairBundleRig();
+    const rig = shouldPackBundleDefs ? currentHairBundleRig() : null;
     const bundleStates = ensureHairBundleSpringStates();
-    for (let defIndex = 0; defIndex < HAIR_BUNDLE_DEFS.length; defIndex += 1) {
-      const def = HAIR_BUNDLE_DEFS[defIndex];
-      const line = rig[def.key];
-      const defOffset = defIndex * 8;
-      hairBundleDefs[defOffset] = line?.root?.x || 0;
-      hairBundleDefs[defOffset + 1] = line?.root?.y || 0;
-      hairBundleDefs[defOffset + 2] = line?.tip?.x || 0;
-      hairBundleDefs[defOffset + 3] = line?.tip?.y || 0;
-      hairBundleDefs[defOffset + 4] = def.layer === "front" ? 1 : 0;
-      hairBundleDefs[defOffset + 5] = def.width;
-      hairBundleDefs[defOffset + 6] = def.layer === layer ? 1 : 0;
+    for (let defIndex = 0; defIndex < activeBundleDefs.length; defIndex += 1) {
+      const def = activeBundleDefs[defIndex];
+      if (shouldPackBundleDefs) {
+        const line = rig[def.key];
+        const defOffset = defIndex * 8;
+        const rootX = line?.root?.x || 0;
+        const rootY = line?.root?.y || 0;
+        const vx = (line?.tip?.x || 0) - rootX;
+        const vy = (line?.tip?.y || 0) - rootY;
+        const len2 = vx * vx + vy * vy;
+        const active = len2 >= 1 ? 1 : 0;
+        hairBundleDefs[defOffset] = rootX;
+        hairBundleDefs[defOffset + 1] = rootY;
+        hairBundleDefs[defOffset + 2] = vx;
+        hairBundleDefs[defOffset + 3] = vy;
+        hairBundleDefs[defOffset + 4] = active ? 1 / len2 : 0;
+        hairBundleDefs[defOffset + 5] = def.width;
+        hairBundleDefs[defOffset + 6] = active;
+        hairBundleDefs[defOffset + 7] = active ? 1 / Math.sqrt(len2) : 0;
+      }
       const bundleSpring = bundleStates[def.key];
       for (let index = 0; index < HAIR_SPRING_BUCKETS; index += 1) {
         writeHairSpringBucket(
@@ -10531,26 +11584,39 @@
       }
     }
 
-    const spec = {
-      controlPoints: buildLayerGpuControlPoints(layerKey),
-      faceRootControlPoints: faceSpec.controlPoints,
-      hairBundleDefs,
-      hairBundleSamples,
-      hairSpringSamples,
-      hairTintEnabled: Boolean(hairTint?.enabled),
-      hairUniforms,
-      kind: shadowTint ? "hair-shadow-v1" : "hair-v1",
-      uniforms: faceSpec.uniforms,
-    };
-    hairGpuWarpSpecCache.set(cacheKey, spec);
+    buildLayerGpuControlPoints(layerKey, spec.controlPoints);
+    spec.dynamicSignature = dynamicSignature;
+    spec.faceRootControlPoints = faceSpec.controlPoints;
+    spec.frame = motionFrameId;
+    spec.hairBundleDefUploadKey = hairBundleDefUploadKey;
+    spec.hairBundleSampleUploadKey = `${motionFrameId}:${layer}`;
+    spec.hairSpringUploadKey = `${motionFrameId}:${layer}`;
+    spec.hairTintEnabled = Boolean(hairTint?.enabled);
+    spec.kind = shadowTint ? "hair-shadow-v1" : "hair-v1";
+    spec.layer = layer;
+    spec.hairUniformUploadKey = `${motionFrameId}:${layer}:${spec.kind}:${dynamicSignature}:${
+      spec.hairTintEnabled ? "tint" : "plain"
+    }`;
+    spec.uniforms = faceSpec.uniforms;
+    perfEndSection("mesh.webgpu.hairWarpSpec", perf);
     return spec;
+  }
+
+  function faceMeshMotionActive() {
+    if (state.editMode || setupModeActive() || state.rangePreviewDirection) return true;
+    if (blinkEvent || blinkClosed) return true;
+    if (voiceLevel > 0.025 || mouthMotionLevel > 0.025 || jawPuniLevel > 0.025) return true;
+    return (
+      Math.abs(state.targetX - state.angleX) > 0.012 ||
+      Math.abs(state.targetY - state.angleY) > 0.012
+    );
   }
 
   function currentFaceMeshSpec() {
     const useTearLensMesh = state.tearLensEnabled && state.tearLensStrength > 0 && !state.eyeSetupMode && !state.faceDepthSetupMode && !blinkClosed;
     const yaw = Math.abs(clamp(state.angleX * (state.angleStrength / 100), -1.6, 1.6));
     const useFeatureTurnMesh = faceTurnDepthAmount() > 0.001 && yaw > 0.02 && !state.eyeSetupMode && !state.faceDepthSetupMode;
-    const useHighMesh = useTearLensMesh || useFeatureTurnMesh;
+    const useHighMesh = faceMeshMotionActive() && (useTearLensMesh || useFeatureTurnMesh);
     return {
       warpFn: (x, y) => tearLensWarpPoint(x, y),
       gpuWarpSpec: () => buildFaceGpuWarpSpec(true),
@@ -10563,10 +11629,12 @@
     if (!layer?.visible || !layer.image || !gpuStageActive()) return;
     const deformSpec = itemLayerDeformFollowSpec(layer);
     if (deformSpec) {
-      if (!prepareDeformedItemSource(layer)) return;
+      const corners = itemLayerLocalCorners(layer);
+      if (!corners) return;
       const resolution = meshResolutionForCurrentQuality(deformSpec.cols, deformSpec.rows);
-      meshRenderer.drawItemDeformSourceWarpedToShadowReceiver(resolution.cols, resolution.rows, {
+      meshRenderer.drawItemDeformLayerToShadowReceiver(layer.image, corners, resolution.cols, resolution.rows, {
         gpuWarpSpec: deformSpec.gpuWarpSpec?.(),
+        sourceAlpha: clamp(layer.opacity / 100, 0, 1),
       });
       return;
     }
@@ -10578,9 +11646,7 @@
   }
 
   function drawFrontHairShadowReceiverItemLayers(slotKey) {
-    for (const layer of itemLayers) {
-      if (layer.slot === slotKey) drawFrontHairShadowReceiverItemLayer(layer);
-    }
+    for (const layer of itemLayersForSlot(slotKey)) drawFrontHairShadowReceiverItemLayer(layer);
   }
 
   function drawFrontHairShadowReceiverMask() {
@@ -10683,12 +11749,12 @@
   function drawGpuHighlightDots(points, diameter, aspect, filmWobbleValue, alpha, sourceAlpha = 1) {
     if (!gpuStageActive() || !lastCharacterTransform || !points) return false;
     try {
-      if (!meshRenderer.drawHighlightSource(points, { alpha: sourceAlpha, aspect, diameter })) return false;
       const resolution = meshResolutionForCurrentQuality(14, 10);
-      meshRenderer.drawHighlightSourceWarpedToStage(resolution.cols, resolution.rows, {
+      meshRenderer.drawHighlightSourceWarpedToStage(points, resolution.cols, resolution.rows, {
         alpha,
         characterTransform: lastCharacterTransform,
         gpuWarpSpec: buildHighlightGpuWarpSpec(filmWobbleValue),
+        sourceOptions: { alpha: sourceAlpha, aspect, diameter },
       });
       return true;
     } catch (error) {
@@ -10809,6 +11875,7 @@
     ctx.textBaseline = "middle";
     ctx.fillText(loadError || "素材を読み込み中...", stage.w / 2, stage.h / 2);
     ctx.restore();
+    if (loadError) loadErrorFramePending = false;
   }
 
   function drawShadow(cx, cy, rx, voice) {
@@ -11028,21 +12095,6 @@
     return renderedCorners.every(Boolean) ? renderedCorners : null;
   }
 
-  function prepareDeformedItemSource(layer) {
-    if (!gpuStageActive()) return false;
-    const corners = itemLayerLocalCorners(layer);
-    if (!corners) return false;
-    try {
-      meshRenderer.drawItemDeformSource(layer.image, corners, {
-        alpha: clamp(layer.opacity / 100, 0, 1),
-      });
-      return true;
-    } catch (error) {
-      disposeGpuStageAfterDrawError("WebGPUアイテム変形元描画", error);
-      return false;
-    }
-  }
-
   function drawArtFlatItemLayer(layer) {
     const corners = itemLayerStageCorners(layer);
     if (!corners) return true;
@@ -11060,12 +12112,14 @@
 
   function drawArtDeformedItemLayer(layer, deformSpec) {
     if (!lastCharacterTransform) return true;
-    if (!prepareDeformedItemSource(layer)) return false;
+    const corners = itemLayerLocalCorners(layer);
+    if (!corners) return false;
     try {
       const resolution = meshResolutionForCurrentQuality(deformSpec.cols, deformSpec.rows);
-      meshRenderer.drawItemDeformSourceWarpedToStage(resolution.cols, resolution.rows, {
+      meshRenderer.drawItemDeformLayerToStage(layer.image, corners, resolution.cols, resolution.rows, {
         characterTransform: lastCharacterTransform,
         gpuWarpSpec: deformSpec.gpuWarpSpec?.(),
+        sourceAlpha: clamp(layer.opacity / 100, 0, 1),
       });
       return true;
     } catch (error) {
@@ -11086,8 +12140,8 @@
   function drawArtItemLayers(slotKey) {
     if (!gpuStageActive()) return false;
     let ok = true;
-    for (const layer of itemLayers) {
-      if (layer.slot === slotKey && !drawArtItemLayer(layer)) ok = false;
+    for (const layer of itemLayersForSlot(slotKey)) {
+      if (!drawArtItemLayer(layer)) ok = false;
     }
     return ok && gpuStageActive();
   }
@@ -11140,9 +12194,7 @@
   }
 
   function drawItemLayers(targetCtx, slotKey) {
-    for (const layer of itemLayers) {
-      if (layer.slot === slotKey) drawItemLayer(targetCtx, layer);
-    }
+    for (const layer of itemLayersForSlot(slotKey)) drawItemLayer(targetCtx, layer);
   }
 
   function itemLayerHitTest(layer, stagePoint) {
@@ -11154,9 +12206,9 @@
 
   function findItemLayerAt(stagePoint, { includeLocked = true } = {}) {
     for (const slotKey of ITEM_HIT_ORDER) {
-      for (let index = itemLayers.length - 1; index >= 0; index -= 1) {
-        const layer = itemLayers[index];
-        if (layer.slot !== slotKey) continue;
+      const layers = itemLayersForSlot(slotKey);
+      for (let index = layers.length - 1; index >= 0; index -= 1) {
+        const layer = layers[index];
         if (!includeLocked && layer.locked) continue;
         if (itemLayerHitTest(layer, stagePoint)) return layer;
       }
@@ -12171,6 +13223,7 @@
       layer.scale = Math.round(clamp(itemDrag.startScale * (distance / itemDrag.startDistance), 10, 500));
     }
 
+    invalidateItemLayerShadowComposite();
     updateItemLayerUi({ rebuildList: false });
     event.preventDefault();
     return true;
@@ -12189,6 +13242,7 @@
 
   function render({ retryingAfterRendererFallback = false } = {}) {
     if (!retryingAfterRendererFallback) rendererFallbackRequested = false;
+    let perf = perfStartSection("render.resize");
     fallbackFromLostWebGpuRenderer();
     resizeCanvas();
     if (gpuStageActive()) {
@@ -12198,35 +13252,67 @@
     } else {
       setStageArtVisible(false);
     }
+    perfEndSection("render.resize", perf);
+    perf = perfStartSection("render.background");
     drawBackground();
+    perfEndSection("render.background", perf);
+    perf = perfStartSection("render.stageBackItems");
     const stageBackDrawn = gpuStageActive() && drawArtItemLayers("stageBack");
     if (!stageBackDrawn) drawItemLayers(ctx, "stageBack");
+    perfEndSection("render.stageBackItems", perf);
     if (!imagesReady) {
+      perf = perfStartSection("render.loading");
       drawLoading();
+      perfEndSection("render.loading", perf);
       if (retryRenderAfterRendererFallback(retryingAfterRendererFallback)) return;
       return;
     }
 
+    perf = perfStartSection("render.transform");
     lastCharacterTransform = computeCharacterTransform();
+    perfEndSection("render.transform", perf);
+    perf = perfStartSection("render.shadow");
     drawShadow(
       lastCharacterTransform.centerX,
       lastCharacterTransform.centerY + lastCharacterTransform.drawH * 0.43,
       lastCharacterTransform.drawW * 0.34,
       lastCharacterTransform.pyokoVoice
     );
+    perfEndSection("render.shadow", perf);
+    perf = perfStartSection("render.characterBackItems");
     drawCharacterAnchoredItemLayers("characterBack");
+    perfEndSection("render.characterBackItems", perf);
+    perf = perfStartSection("render.backHair");
     drawBackHairLayer();
+    perfEndSection("render.backHair", perf);
+    perf = perfStartSection("render.faceBackItems");
     drawCharacterAnchoredItemLayers("faceBack");
+    perfEndSection("render.faceBackItems", perf);
+    perf = perfStartSection("render.faceAndHighlight");
     drawFaceAndHighlightLayer();
+    perfEndSection("render.faceAndHighlight", perf);
+    perf = perfStartSection("render.faceFrontItems");
     drawCharacterAnchoredItemLayers("faceFront");
+    perfEndSection("render.faceFrontItems", perf);
+    perf = perfStartSection("render.frontHairShadow");
     drawFrontHairCastShadow();
+    perfEndSection("render.frontHairShadow", perf);
+    perf = perfStartSection("render.frontHair");
     drawFrontHairLayer();
+    perfEndSection("render.frontHair", perf);
+    perf = perfStartSection("render.frontHairFrontItems");
     drawCharacterAnchoredItemLayers("frontHairFront");
+    perfEndSection("render.frontHairFrontItems", perf);
+    perf = perfStartSection("render.meshGuide");
     drawCharacterMeshGuideLayer();
+    perfEndSection("render.meshGuide", perf);
+    perf = perfStartSection("render.stageFrontItems");
     const stageFrontDrawn = gpuStageActive() && drawArtItemLayers("stageFront");
     if (!stageFrontDrawn) drawItemLayers(ctx, "stageFront");
+    perfEndSection("render.stageFrontItems", perf);
     if (retryRenderAfterRendererFallback(retryingAfterRendererFallback)) return;
     if (OBS_MODE) return;
+    perf = perfStartSection("render.overlays");
     drawItemSelectionOverlay();
     drawEditOverlay();
     drawEyeSetupOverlay();
@@ -12235,6 +13321,7 @@
     drawNeckPivotSetupOverlay();
     drawHairBundleSetupOverlay();
     drawCharacterWizardOverlay();
+    perfEndSection("render.overlays", perf);
   }
 
   function createFaceTracker(onPose) {
@@ -12370,6 +13457,7 @@
 
       const now = performance.now();
       let result = null;
+      const perf = perfStartSection("faceTracking.detect");
       try {
         result = st.landmarker.detectForVideo(st.video, now);
       } catch (error) {
@@ -12381,6 +13469,8 @@
           setFaceTrackStatus("顔トラッキング: 検出エラーが続いたため停止しました", true);
         }
         return;
+      } finally {
+        perfEndSection("faceTracking.detect", perf);
       }
       st.detectErrorCount = 0;
 
@@ -12594,7 +13684,12 @@
   }
 
   function currentRawVoiceLevel() {
-    return state.demoTalk ? demoLevel(animationSeconds) : audioEngine.level() * (state.micGain / 100);
+    const perf = perfStartSection("audio.level");
+    try {
+      return state.demoTalk ? demoLevel(animationSeconds) : audioEngine.level() * (state.micGain / 100);
+    } finally {
+      perfEndSection("audio.level", perf);
+    }
   }
 
   function updateVoiceFromRaw(raw, nowMs) {
@@ -12636,102 +13731,284 @@
     updateVoiceFromRaw(raw, nowMs);
   }
 
-  function nextActiveAnimationDelayMs() {
-    if (OBS_MODE || setupModeActive() || state.rangePreviewDirection || !activeAnimationLastFrameAt) return 0;
-    return Math.max(0, activeAnimationFrameDelayMs() - (performance.now() - activeAnimationLastFrameAt) + 1);
+  function resetAnimationCadence() {
+    animationCadenceTargetTimestamp = 0;
+    animationCadenceLastRafTimestamp = 0;
+    animationCadenceRafIntervalMs = RAF_CADENCE_LEAD_MS;
+    scheduledTickMinDelayMs = 0;
+    scheduledTickTargetTimestamp = 0;
   }
 
-  function requestNextTick() {
-    if (tickRafId || tickTimerId) return;
-    const delay = nextActiveAnimationDelayMs();
-    if (delay > 1) {
-      tickTimerId = window.setTimeout(() => {
-        tickTimerId = 0;
-        tickRafId = requestAnimationFrame(tick);
-      }, delay);
+  function recordAnimationCadenceRafTimestamp(timestamp) {
+    if (animationCadenceLastRafTimestamp > 0) {
+      const interval = timestamp - animationCadenceLastRafTimestamp;
+      if (interval > 0 && interval < 100) {
+        animationCadenceRafIntervalMs = animationCadenceRafIntervalMs * 0.8 + interval * 0.2;
+      }
+    }
+    animationCadenceLastRafTimestamp = timestamp;
+  }
+
+  function shouldWaitForCadenceRaf(timestamp, targetTimestamp) {
+    if (targetTimestamp <= 0) return false;
+    const earlyByMs = targetTimestamp - timestamp;
+    if (earlyByMs <= 0) return false;
+    return earlyByMs > animationCadenceRafIntervalMs * 0.5;
+  }
+
+  function frameDelayForCurrentMode() {
+    if (OBS_MODE) return 1000 / currentObsRenderFps();
+    if (setupModeActive() || state.rangePreviewDirection) return 0;
+    return activeAnimationFrameDelayMs();
+  }
+
+  function animationDelayForMotionReason(reason) {
+    if (!reason) return null;
+    if (reason.startsWith("drag.")) return 0;
+    if (reason === "setup" || reason === "rangePreview" || reason === "faceTracking") return 0;
+    if (reason === "obs") return 1000 / currentObsRenderFps();
+    if (reason === "obsPublish") return 1000 / currentObsPreset().sendFps;
+    return activeAnimationFrameDelayMs();
+  }
+
+  function nextAnimationDecision(nowMs = performance.now()) {
+    const motionReason = runtimeMotionReason(nowMs);
+    if (motionReason) {
+      const delayMs = animationDelayForMotionReason(motionReason);
+      return {
+        delayMs,
+        rafCadence: delayMs > 0,
+        reason: `active.${motionReason}`,
+      };
+    }
+    const ambientReason = runtimeAmbientMotionReason();
+    if (ambientReason) {
+      return {
+        delayMs: activeAnimationFrameDelayMs(),
+        rafCadence: true,
+        reason: `${ambientReason}.activeFps`,
+      };
+    }
+    const idleHoldDelay = idleMotionHoldDelay(nowMs);
+    if (idleHoldDelay !== null) {
+      return {
+        delayMs: idleHoldDelay,
+        reason: "idleMotion.hold",
+      };
+    }
+    return { delayMs: null, reason: "idle" };
+  }
+
+  function requestAnimationTick(options = {}) {
+    const reason = String(options.reason || "loop");
+    if (options.delayMs === null) {
+      perfRecordSchedulerRequest("scheduler.request.skip.nullDelay", reason);
       return;
     }
+    const delayMs = Math.max(0, Number(options.delayMs) || 0);
+    const immediate = Boolean(options.immediate);
+    const minDelayMs = Math.max(0, Number(options.minDelayMs) || 0);
+    const rafCadence = Boolean(options.rafCadence);
+    const requestedTargetTimestamp = Math.max(0, Number(options.targetTimestamp) || 0);
+    if (tickRafId) {
+      perfRecordSchedulerRequest("scheduler.request.skip.rafPending", reason);
+      return;
+    }
+    if (immediate && tickTimerId) {
+      clearTimeout(tickTimerId);
+      tickTimerId = 0;
+      perfRecordCounter("scheduler.request.clearTimer.immediate");
+    }
+    if (tickTimerId) {
+      perfRecordSchedulerRequest("scheduler.request.skip.timerPending", reason);
+      return;
+    }
+    scheduledTickReason = reason;
+    if (delayMs > 0 && rafCadence) {
+      const nowMs = performance.now();
+      let targetTimestamp = requestedTargetTimestamp;
+      if (targetTimestamp <= 0) {
+        let baseTimestamp = animationCadenceTargetTimestamp || lastTimestamp || nowMs;
+        if (baseTimestamp < nowMs - delayMs * 2) baseTimestamp = lastTimestamp || nowMs;
+        targetTimestamp = baseTimestamp + delayMs;
+      }
+      const timerDelayMs = Math.max(0, targetTimestamp - nowMs - RAF_CADENCE_LEAD_MS);
+      if (timerDelayMs <= 0) {
+        scheduledTickMinDelayMs = delayMs;
+        scheduledTickTargetTimestamp = targetTimestamp;
+        perfRecordSchedulerRequest("scheduler.request.rafCadence", reason);
+        tickRafId = requestAnimationFrame(tick);
+        return;
+      }
+      perfRecordSchedulerRequest("scheduler.request.timeout.rafCadence", reason);
+      tickTimerId = window.setTimeout(() => {
+        tickTimerId = 0;
+        requestAnimationTick({
+          immediate: true,
+          minDelayMs: delayMs,
+          rafCadence: true,
+          reason,
+          targetTimestamp,
+        });
+      }, timerDelayMs);
+      return;
+    }
+    if (delayMs > 0) {
+      perfRecordSchedulerRequest("scheduler.request.timeout.active", reason);
+      tickTimerId = window.setTimeout(() => {
+        tickTimerId = 0;
+        requestAnimationTick({ immediate: true, reason });
+      }, delayMs);
+      return;
+    }
+    scheduledTickMinDelayMs = minDelayMs;
+    scheduledTickTargetTimestamp = requestedTargetTimestamp;
+    perfRecordSchedulerRequest("scheduler.request.raf", reason);
     tickRafId = requestAnimationFrame(tick);
   }
 
-  function tick(timestamp) {
+  function requestNextTick(timestamp = performance.now(), reason = "loop") {
+    const decision = nextAnimationDecision(timestamp);
+    requestAnimationTick(reason === "loop" ? decision : { ...decision, reason });
+  }
+
+  function cancelAnimationTick() {
+    resetAnimationCadence();
+    if (tickTimerId) {
+      clearTimeout(tickTimerId);
+      tickTimerId = 0;
+    }
+    if (!tickRafId) return;
+    cancelAnimationFrame(tickRafId);
     tickRafId = 0;
-    const obsFrameInterval = OBS_MODE ? 1000 / currentObsRenderFps() : 0;
-    const obsFrameSkipThreshold = Math.max(0, obsFrameInterval - 8);
-    if (OBS_MODE && obsLastFrameAt && timestamp - obsLastFrameAt < obsFrameSkipThreshold) {
-      requestNextTick();
+  }
+
+  function noteRuntimeActivity(reason = "activity") {
+    lastRuntimeActivityAt = performance.now();
+    if (document.visibilityState === "hidden") return;
+    requestAnimationTick({ immediate: true, reason });
+  }
+
+  function tick(timestamp) {
+    const frameReason = scheduledTickReason || "unknown";
+    const frameMinDelayMs = scheduledTickMinDelayMs;
+    const frameTargetTimestamp = scheduledTickTargetTimestamp;
+    tickRafId = 0;
+    scheduledTickMinDelayMs = 0;
+    scheduledTickTargetTimestamp = 0;
+    recordAnimationCadenceRafTimestamp(timestamp);
+
+    if (
+      frameTargetTimestamp > 0 &&
+      frameMinDelayMs > 0 &&
+      shouldWaitForCadenceRaf(timestamp, frameTargetTimestamp)
+    ) {
+      perfRecordCounter("scheduler.rafCadence.early");
+      requestAnimationTick({
+        immediate: true,
+        minDelayMs: frameMinDelayMs,
+        rafCadence: true,
+        reason: frameReason,
+        targetTimestamp: frameTargetTimestamp,
+      });
       return;
     }
+
+    if (frameTargetTimestamp > 0) animationCadenceTargetTimestamp = frameTargetTimestamp;
     if (OBS_MODE) obsLastFrameAt = timestamp;
-    const setupActive = setupModeActive();
-    const activeFrameInterval = !OBS_MODE && !setupActive && !state.rangePreviewDirection ? activeAnimationFrameDelayMs() : 0;
-    const activeFrameSkipThreshold = Math.max(0, activeFrameInterval - 4);
-    if (activeFrameInterval && activeAnimationLastFrameAt && timestamp - activeAnimationLastFrameAt < activeFrameSkipThreshold) {
-      requestNextTick();
-      return;
-    }
-    activeAnimationLastFrameAt = activeFrameInterval ? timestamp : 0;
+    else activeAnimationLastFrameAt = timestamp;
     if (!lastTimestamp) lastTimestamp = timestamp;
-    const maxDelta = activeFrameInterval ? Math.max(0.05, activeFrameInterval / 1000 + 0.02) : 0.05;
-    const delta = Math.max(0, Math.min(maxDelta, (timestamp - lastTimestamp) / 1000));
+    const delta = Math.max(
+      0,
+      Math.min(MAX_FRAME_DELTA_SECONDS, (timestamp - lastTimestamp) / 1000),
+    );
     lastTimestamp = timestamp;
     motionFrameId += 1;
+    perfBeginFrame(timestamp, delta);
+    perfRecordCounter(`frame.reason.${frameReason}`);
 
-    if (setupActive || state.rangePreviewDirection) {
-      if (setupActive) {
-        state.targetX = 0;
-        state.targetY = 0;
-        state.angleX = 0;
-        state.angleY = 0;
-      } else {
-        applyRangePreviewTarget(state.rangePreviewDirection);
+    try {
+      const setupActive = setupModeActive();
+      if (setupActive || state.rangePreviewDirection) {
+        const setupPerf = perfStartSection(setupActive ? "tick.setupReset" : "tick.rangePreview");
+        if (setupActive) {
+          state.targetX = 0;
+          state.targetY = 0;
+          state.angleX = 0;
+          state.angleY = 0;
+        } else {
+          applyRangePreviewTarget(state.rangePreviewDirection);
+        }
+        blinkClosed = false;
+        mouthState = 0;
+        voiceLevel = 0;
+        voicePeak = 0;
+        lastVoiceRaw = 0;
+        mouthMotionLevel = 0;
+        jawPuniLevel = 0;
+        highlightPulseLeftX = 1;
+        highlightPulseLeftY = 1;
+        highlightPulseRightX = 1;
+        highlightPulseRightY = 1;
+        highlightPulseLeftTargetX = 1;
+        highlightPulseLeftTargetY = 1;
+        highlightPulseRightTargetX = 1;
+        highlightPulseRightTargetY = 1;
+        highlightGyroX = 0;
+        highlightGyroY = 0;
+        highlightGyroLagX = 0;
+        highlightGyroLagY = 0;
+        if (ui.meterFill) ui.meterFill.style.width = "0%";
+        if (ui.mouthReadout) ui.mouthReadout.textContent = "とじ";
+        if (ui.angleReadout)
+          ui.angleReadout.textContent = `${Math.round(state.angleX * 100)}, ${Math.round(state.angleY * 100)}`;
+        perfEndSection(setupActive ? "tick.setupReset" : "tick.rangePreview", setupPerf);
+        const renderPerf = perfStartSection("tick.render");
+        render();
+        perfEndSection("tick.render", renderPerf);
+        requestNextTick(timestamp, setupActive ? "setup" : "rangePreview");
+        return;
       }
-      blinkClosed = false;
-      mouthState = 0;
-      voiceLevel = 0;
-      voicePeak = 0;
-      lastVoiceRaw = 0;
-      mouthMotionLevel = 0;
-      jawPuniLevel = 0;
-      highlightPulseLeftX = 1;
-      highlightPulseLeftY = 1;
-      highlightPulseRightX = 1;
-      highlightPulseRightY = 1;
-      highlightPulseLeftTargetX = 1;
-      highlightPulseLeftTargetY = 1;
-      highlightPulseRightTargetX = 1;
-      highlightPulseRightTargetY = 1;
-      highlightGyroX = 0;
-      highlightGyroY = 0;
-      highlightGyroLagX = 0;
-      highlightGyroLagY = 0;
-      if (ui.meterFill) ui.meterFill.style.width = "0%";
-      if (ui.mouthReadout) ui.mouthReadout.textContent = "とじ";
-      if (ui.angleReadout) ui.angleReadout.textContent = `${Math.round(state.angleX * 100)}, ${Math.round(state.angleY * 100)}`;
+
+      animationSeconds += delta;
+
+      let perf = perfStartSection("tick.idleMotion");
+      if (OBS_MODE) applyObsExternalTarget(timestamp);
+      else updateIdleMotionTarget(timestamp);
+      perfEndSection("tick.idleMotion", perf);
+      perf = perfStartSection("tick.follow");
+      if (state.editMode) {
+        setEditPreviewFromKey();
+      } else {
+        const follow60 = clamp(state.followSpeed / 100, 0.02, 0.5);
+        const follow = frameIndependentLerpFactor(follow60, delta);
+        state.angleX += (state.targetX - state.angleX) * follow;
+        state.angleY += (state.targetY - state.angleY) * follow;
+      }
+      perfEndSection("tick.follow", perf);
+      perf = perfStartSection("tick.poseBlink");
+      maybeTriggerPoseSettleBlink(timestamp, delta);
+      perfEndSection("tick.poseBlink", perf);
+      perf = perfStartSection("tick.voice");
+      updateVoice(timestamp);
+      publishObsInput(timestamp);
+      perfEndSection("tick.voice", perf);
+      perf = perfStartSection("tick.blink");
+      advanceBlinkEvent(timestamp);
+      perfEndSection("tick.blink", perf);
+      perf = perfStartSection("tick.hairPhysics");
+      updateHairPhysics(delta);
+      perfEndSection("tick.hairPhysics", perf);
+      perf = perfStartSection("tick.highlightPulse");
+      updateHighlightPulse(delta);
+      perfEndSection("tick.highlightPulse", perf);
+      perf = perfStartSection("tick.render");
       render();
-      requestNextTick();
-      return;
+      perfEndSection("tick.render", perf);
+      requestNextTick(timestamp, OBS_MODE ? "obs" : "active");
+    } finally {
+      perfEndFrame();
     }
-
-    animationSeconds += delta;
-
-    if (OBS_MODE) applyObsExternalTarget(timestamp);
-    else updateIdleMotionTarget(timestamp);
-    if (state.editMode) {
-      setEditPreviewFromKey();
-    } else {
-      const follow = clamp(state.followSpeed / 100, 0.02, 0.5);
-      state.angleX += (state.targetX - state.angleX) * follow;
-      state.angleY += (state.targetY - state.angleY) * follow;
-    }
-    maybeTriggerPoseSettleBlink(timestamp, delta);
-    updateVoice(timestamp);
-    publishObsInput(timestamp);
-    advanceBlinkEvent(timestamp);
-    updateHairPhysics(delta);
-    updateHighlightPulse(delta);
-    render();
-    requestNextTick();
   }
 
   function randomBetween(min, max) {
@@ -12791,6 +14068,7 @@
       phaseStartedAt: performance.now(),
     };
     blinkClosed = false;
+    requestAnimationTick({ immediate: true, reason: `blink.${kind}` });
     return true;
   }
 
@@ -13110,20 +14388,25 @@
     if (document.visibilityState === "visible") {
       lastTimestamp = 0;
       activeAnimationLastFrameAt = 0;
-      if (tickTimerId) {
-        clearTimeout(tickTimerId);
-        tickTimerId = 0;
-      }
+      obsLastFrameAt = 0;
+      resetAnimationCadence();
+      if (state.autoBlink) scheduleBlink();
+      lastRuntimeActivityAt = performance.now();
       requestNextTick();
+      return;
     }
+    cancelAnimationTick();
+    resetBlinkEventState();
   }
 
   function shutdownResources() {
+    cancelAnimationTick();
     closeObsEventSource();
     clearTimeout(blinkTimer);
     audioEngine.close().catch(() => {});
     meshRenderer?.dispose?.();
     meshRenderer = null;
+    invalidateFrontHairShadowComposite();
     micOn = false;
     micPending = false;
     if (ui.micButton) ui.micButton.disabled = false;
@@ -13138,10 +14421,15 @@
 
   function restoreResourcesAfterPageShow(event) {
     lastTimestamp = 0;
+    activeAnimationLastFrameAt = 0;
+    obsLastFrameAt = 0;
+    resetAnimationCadence();
     if (event.persisted) {
       resetMeshRendererAfterAvatarImageChange();
     }
     if (OBS_MODE) connectObsEventSource();
+    lastRuntimeActivityAt = performance.now();
+    if (document.visibilityState === "visible") requestNextTick();
   }
 
   function handlePageHide() {
@@ -13154,6 +14442,7 @@
   function bindLifecycleEvents() {
     window.addEventListener("resize", () => {
       panelRectCache = null;
+      noteRuntimeActivity("resize");
       if (resizePending) return;
       resizePending = true;
       requestAnimationFrame(() => {
@@ -13161,6 +14450,10 @@
         resizeCanvas();
       });
     });
+    document.addEventListener("input", () => noteRuntimeActivity("input"), true);
+    document.addEventListener("change", () => noteRuntimeActivity("change"), true);
+    document.addEventListener("click", () => noteRuntimeActivity("click"), true);
+    document.addEventListener("keydown", () => noteRuntimeActivity("keydown"), true);
     document.addEventListener("visibilitychange", resetFrameTimingOnResume);
     window.addEventListener("pagehide", handlePageHide);
     window.addEventListener("pageshow", restoreResourcesAfterPageShow);
@@ -13320,6 +14613,7 @@
         layer.visible = !layer.visible;
         activeItemLayerId = id;
         itemHandleVisible = false;
+        invalidateItemLayerShadowComposite();
         updateItemLayerUi();
         markActiveCharacterDirty("settings", "item-visible");
         return;
@@ -13355,6 +14649,7 @@
         }
       }
       itemHandleVisible = true;
+      markItemLayerSlotsDirty();
       updateItemLayerUi();
       markActiveCharacterDirty("settings", "item-slot");
     });
@@ -13364,6 +14659,7 @@
       if (!layer || layer.locked || !itemLayerSupportsDeformFollow(layer)) return;
       layer.deformFollowEnabled = ui.itemDeformFollowEnabled.checked;
       itemHandleVisible = true;
+      invalidateItemLayerShadowComposite();
       updateItemLayerUi();
       markActiveCharacterDirty("settings", "item-deform-follow");
     });
@@ -13380,6 +14676,7 @@
       layer.x = 0;
       layer.y = 0;
       itemHandleVisible = true;
+      invalidateItemLayerShadowComposite();
       updateItemLayerUi({ rebuildList: false });
       markActiveCharacterDirty("settings", "item-center");
     });
@@ -13453,6 +14750,7 @@
     ui.activeAnimationFps?.addEventListener("input", () => {
       state.activeAnimationFps = activeAnimationFps();
       activeAnimationLastFrameAt = 0;
+      resetAnimationCadence();
       if (tickTimerId) {
         clearTimeout(tickTimerId);
         tickTimerId = 0;
@@ -13730,6 +15028,7 @@
       state.targetY = 0;
       resetIdleMotionPlan();
       if (isFaceTrackingActive()) faceTracker.requestCalibration();
+      noteRuntimeActivity("center");
     });
 
     ui.mouseFollowButton?.addEventListener("click", () => {
@@ -13739,6 +15038,7 @@
         state.targetY = 0;
       }
       updateMouseFollowButton();
+      noteRuntimeActivity("mouseFollow.toggle");
     });
 
     ui.testLeftButton?.addEventListener("click", () => setRangePreviewDirection("left"));
@@ -13751,6 +15051,7 @@
       state.demoTalk = !state.demoTalk;
       ui.demoTalkButton.textContent = `口パクデモ ${state.demoTalk ? "ON" : "OFF"}`;
       ui.demoTalkButton.setAttribute("aria-pressed", String(state.demoTalk));
+      noteRuntimeActivity("demoTalk.toggle");
     });
 
     ui.idleMotionButton?.addEventListener("click", () => {
@@ -13767,6 +15068,7 @@
       }
       syncButtonPressed(ui.idleMotionButton, "待機モーション ON", "待機モーション OFF", state.idleMotionEnabled);
       updateMouseFollowButton();
+      noteRuntimeActivity("idleMotion.toggle");
     });
 
     ui.diagonalFaceWarpButton?.addEventListener("click", () => {
@@ -13782,6 +15084,7 @@
       ui.blinkButton.setAttribute("aria-pressed", String(state.autoBlink));
       scheduleBlink();
       markActiveCharacterDirty("settings", "auto-blink");
+      noteRuntimeActivity("blink.toggle");
     });
 
     ui.micButton?.addEventListener("click", async () => {
@@ -13810,6 +15113,7 @@
       } finally {
         ui.micButton.disabled = false;
         micPending = false;
+        noteRuntimeActivity("mic.toggle");
       }
     });
 
@@ -13820,6 +15124,7 @@
         ui.faceTrackButton.textContent = "顔トラッキング開始";
         ui.faceTrackButton.setAttribute("aria-pressed", "false");
         setFaceTrackStatus("顔トラッキング: OFF（マウス操作）");
+        noteRuntimeActivity("faceTracking.stop");
         return;
       }
 
@@ -13830,6 +15135,7 @@
         await faceTracker.start();
         ui.faceTrackButton.textContent = "顔トラッキング停止";
         ui.faceTrackButton.setAttribute("aria-pressed", "true");
+        noteRuntimeActivity("faceTracking.start");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         setFaceTrackStatus(`顔トラッキング: ${message}`, true);
@@ -13867,15 +15173,42 @@
 
   function bindCanvasInteractionControls() {
     canvas.addEventListener("pointerdown", (event) => {
-      if (handleCharacterWizardPointerDown(event)) return;
-      if (handleEditPointerDown(event)) return;
-      if (handleEyeSetupPointerDown(event)) return;
-      if (handleHighlightSetupPointerDown(event)) return;
-      if (handleFaceDepthSetupPointerDown(event)) return;
-      if (handleNeckPivotSetupPointerDown(event)) return;
-      if (handleHairBundleSetupPointerDown(event)) return;
-      if (handleItemPointerDown(event)) return;
-      if (handleCharacterPointerDown(event)) return;
+      if (handleCharacterWizardPointerDown(event)) {
+        noteRuntimeActivity("pointer.characterWizard");
+        return;
+      }
+      if (handleEditPointerDown(event)) {
+        noteRuntimeActivity("pointer.edit");
+        return;
+      }
+      if (handleEyeSetupPointerDown(event)) {
+        noteRuntimeActivity("pointer.eyeSetup");
+        return;
+      }
+      if (handleHighlightSetupPointerDown(event)) {
+        noteRuntimeActivity("pointer.highlightSetup");
+        return;
+      }
+      if (handleFaceDepthSetupPointerDown(event)) {
+        noteRuntimeActivity("pointer.faceDepthSetup");
+        return;
+      }
+      if (handleNeckPivotSetupPointerDown(event)) {
+        noteRuntimeActivity("pointer.neckPivotSetup");
+        return;
+      }
+      if (handleHairBundleSetupPointerDown(event)) {
+        noteRuntimeActivity("pointer.hairBundleSetup");
+        return;
+      }
+      if (handleItemPointerDown(event)) {
+        noteRuntimeActivity("pointer.item");
+        return;
+      }
+      if (handleCharacterPointerDown(event)) {
+        noteRuntimeActivity("pointer.character");
+        return;
+      }
       if (state.mouseFollowEnabled && !interactionModeActive() && !isFaceTrackingActive()) updatePointerTarget(event.clientX, event.clientY);
     });
     canvas.addEventListener("pointermove", (event) => {
@@ -13918,8 +15251,13 @@
       if (isFaceTrackingActive()) return;
       if (state.idleMotionEnabled) return;
       if (!state.mouseFollowEnabled) return;
+      const previousX = state.targetX;
+      const previousY = state.targetY;
       state.targetX = 0;
       state.targetY = 0;
+      if (Math.abs(previousX) > 0.0005 || Math.abs(previousY) > 0.0005) {
+        noteRuntimeActivity("pointer.leave");
+      }
     });
   }
 
@@ -13984,7 +15322,7 @@
       return Promise.all([loadObsSnapshotIfAvailable(), loadObsConfigIfAvailable()]);
     })
     .catch((error) => {
-      loadError = error instanceof Error ? error.message : String(error);
+      setLoadError(error);
       setStatus("error");
       console.error("loadAssets failed", error);
     });

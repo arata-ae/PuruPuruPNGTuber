@@ -23,6 +23,8 @@ class QuietNoCacheHandler(NoCacheHandler):
 
 
 class ProjectStaticTests(unittest.TestCase):
+    _ignored_path_cache: set[Path] | None = None
+
     def read_text(self, relative: str) -> str:
         return (ROOT / relative).read_text(encoding="utf-8")
 
@@ -97,10 +99,24 @@ class ProjectStaticTests(unittest.TestCase):
         return struct.unpack(">II", data[:8])
 
     def iter_public_paths(self):
+        if self._ignored_path_cache is None:
+            result = subprocess.run(
+                ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+                cwd=ROOT,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            self.__class__._ignored_path_cache = {
+                ROOT / item.decode("utf-8")
+                for item in result.stdout.split(b"\0")
+                if item
+            }
         for path in ROOT.rglob("*"):
             if ".git" in path.parts:
                 continue
             if "__pycache__" in path.parts:
+                continue
+            if path in self._ignored_path_cache:
                 continue
             yield path
 
@@ -567,6 +583,9 @@ class ProjectStaticTests(unittest.TestCase):
             "const MAX_OBS_SNAPSHOT_JSON_BYTES = 24 * 1024 * 1024",
             "const MAX_OBS_SNAPSHOT_AVATAR_IMAGE_DATA_URL_SIZE = 12 * 1024 * 1024",
             "validatePngDataUrl(src, name, MAX_OBS_SNAPSHOT_AVATAR_IMAGE_DATA_URL_SIZE)",
+            "validateAvatarImageSize(pngU8Dimensions(u8, name), name)",
+            "sanitizeImportedJsonValue(JSON.parse(raw), 0, null, {",
+            "maxDataUrlStringLength: MAX_OBS_SNAPSHOT_AVATAR_IMAGE_DATA_URL_SIZE",
             "return await applyObsSnapshot(snapshot)",
             "Promise.allSettled(Object.keys(AVATAR_PACKAGE_ASSETS).map",
             "function closeObsEventSource(",
@@ -694,12 +713,12 @@ class ProjectStaticTests(unittest.TestCase):
         self.assertIn("function meshResolutionForCurrentQuality(cols, rows)", app)
         self.assertIn('const qualityScale = quality === "low" ? 0.58 : quality === "standard" ? 0.82 : 1', app)
         self.assertIn("meshRenderer.drawStageWarpedImage(image, resolution.cols, resolution.rows, {", app)
-        self.assertIn("meshRenderer.drawItemDeformSourceWarpedToShadowReceiver(resolution.cols, resolution.rows", app)
+        self.assertIn("meshRenderer.drawItemDeformLayerToShadowReceiver(layer.image, corners, resolution.cols, resolution.rows", app)
         self.assertIn("meshRenderer.drawFrontHairShadowReceiverWarpedImage(images.backHair, hairResolution.cols, hairResolution.rows", app)
         self.assertIn("meshRenderer.drawFrontHairShadowReceiverWarpedImage(images[expressionKey()], faceResolution.cols, faceResolution.rows", app)
         self.assertIn("meshRenderer.drawFrontHairShadowComposite(images.frontHair, resolution.cols, resolution.rows", app)
-        self.assertIn("meshRenderer.drawHighlightSourceWarpedToStage(resolution.cols, resolution.rows", app)
-        self.assertIn("meshRenderer.drawItemDeformSourceWarpedToStage(resolution.cols, resolution.rows", app)
+        self.assertIn("meshRenderer.drawHighlightSourceWarpedToStage(points, resolution.cols, resolution.rows", app)
+        self.assertIn("meshRenderer.drawItemDeformLayerToStage(layer.image, corners, resolution.cols, resolution.rows", app)
         self.assertIn('meshRenderer.beginStageFrame({ bgColor: state.bgColor, transparent: OBS_TRANSPARENT })', app)
         self.assertIn('function fallbackFromLostWebGpuRenderer()', app)
         self.assertIn("function retryRenderAfterRendererFallback(retryingAfterRendererFallback)", app)
@@ -715,38 +734,90 @@ class ProjectStaticTests(unittest.TestCase):
         self.assertIn('for (var i = 0u; i < ${HAIR_BUNDLE_DEFS.length}u; i = i + 1u)', app)
         self.assertIn("meshGpuResourcesPromise = null;", app)
         self.assertIn('rendererKind: "canvas"', app)
-        self.assertIn("rendererKind: 'webgpu'", app)
+        self.assertIn('rendererKind: "webgpu"', app)
         self.assertIn('id="activeAnimationFps"', html)
         self.assertIn('<output for="activeAnimationFps">24fps</output>', html)
         self.assertIn("const ACTIVE_ANIMATION_FPS_DEFAULT = 24", app)
+        self.assertIn("const ANIMATION_SCHEDULER_VERSION = 4", app)
+        self.assertIn("const MAX_FRAME_DELTA_SECONDS = 0.12", app)
+        self.assertIn("const RAF_CADENCE_LEAD_MS = 1000 / ACTIVE_ANIMATION_FPS_MAX", app)
+        self.assertIn("const RECENT_ACTIVITY_MS = 700", app)
+        self.assertIn("const IDLE_MOTION_HOLD_MAX_DELAY_MS = 500", app)
         self.assertIn("activeAnimationFps: ACTIVE_ANIMATION_FPS_DEFAULT", app)
         self.assertIn('activeAnimationFps: document.querySelector("#activeAnimationFps")', app)
         self.assertIn('bindRange("activeAnimationFps", "activeAnimationFps", "fps")', app)
         self.assertIn("function activeAnimationFrameDelayMs()", app)
+        self.assertIn("function frameDelayForCurrentMode()", app)
+        self.assertIn("function runtimeMotionReason(nowMs = performance.now())", app)
+        self.assertIn("function runtimeAmbientMotionReason()", app)
+        self.assertIn("function idleMotionHoldDelay(nowMs = performance.now())", app)
+        self.assertIn("function nextAnimationDecision(nowMs = performance.now())", app)
+        self.assertIn("function requestAnimationTick(options = {})", app)
+        self.assertIn("if (options.delayMs === null)", app)
+        self.assertIn("function shouldWaitForCadenceRaf(timestamp, targetTimestamp)", app)
+        self.assertIn("animationCadenceRafIntervalMs * 0.5", app)
+        self.assertIn("function frameIndependentLerpFactor(perFrameFactor, delta, baseFps = 60)", app)
         self.assertIn("const interval = 1000 / currentObsPreset().sendFps;", app)
-        self.assertIn("function nextActiveAnimationDelayMs()", app)
-        self.assertIn("function requestNextTick()", app)
-        self.assertIn("tickTimerId = window.setTimeout(() => {", app)
+        self.assertIn('function requestNextTick(timestamp = performance.now(), reason = "loop")', app)
+        self.assertIn('return { delayMs: null, reason: "idle" };', app)
+        self.assertIn('requestAnimationTick({ immediate: true, reason: `blink.${kind}` });', app)
+        self.assertIn('document.addEventListener("input", () => noteRuntimeActivity("input"), true);', app)
+        self.assertIn('noteRuntimeActivity("settings.loaded");', app)
+        self.assertIn('noteRuntimeActivity("obs-publish");', app)
+        self.assertIn("loadErrorFramePending ? \"loadErrorFrame\" : null", app)
+        self.assertIn('if (obsPublishEnabled) return "obsPublish";', app)
+        self.assertIn('if (reason === "obsPublish") return 1000 / currentObsPreset().sendFps;', app)
+        self.assertIn('if (Number(state.rollStrength) > 0) return "ambient.roll";', app)
+        self.assertIn('if (state.highlightEnabled && Number(state.highlightFilmWobble) > 0) return "ambient.highlightFilm";', app)
+        self.assertIn('if (state.subHighlightEnabled && Number(state.subHighlightFilmWobble) > 0) return "ambient.subHighlightFilm";', app)
+        self.assertIn('if (state.tearLensEnabled && Number(state.tearLensStrength) > 0) return "ambient.tearLens";', app)
+        self.assertIn("animationCadenceTargetTimestamp", app)
+        self.assertIn("scheduledTickTargetTimestamp", app)
+        self.assertIn("perfRecordCounter(\"scheduler.rafCadence.early\")", app)
         self.assertIn('ui.activeAnimationFps?.addEventListener("input", () => {\n      state.activeAnimationFps = activeAnimationFps();\n      activeAnimationLastFrameAt = 0;', app)
-        self.assertIn("OBS_MODE || setupModeActive() || state.rangePreviewDirection", app)
-        self.assertIn("!OBS_MODE && !setupActive && !state.rangePreviewDirection ? activeAnimationFrameDelayMs() : 0", app)
+        self.assertIn("if (OBS_MODE) return 1000 / currentObsRenderFps();", app)
+        self.assertIn("if (setupModeActive() || state.rangePreviewDirection) return 0;", app)
         self.assertNotIn("obsPublishFrameDelayMs", app)
         self.assertNotIn("OBS_MODE || obsPublishEnabled || setupModeActive()", app)
         self.assertNotIn("!OBS_MODE && !obsPublishEnabled && !setupActive", app)
         self.assertIn("if (obsPublishEnabled) {\n      activeAnimationLastFrameAt = 0;", app)
-        self.assertIn("activeAnimationLastFrameAt = activeFrameInterval ? timestamp : 0;", app)
-        self.assertIn("const maxDelta = activeFrameInterval ? Math.max(0.05, activeFrameInterval / 1000 + 0.02) : 0.05;", app)
+        self.assertIn("if (OBS_MODE) obsLastFrameAt = timestamp;", app)
+        self.assertIn("Math.min(MAX_FRAME_DELTA_SECONDS, (timestamp - lastTimestamp) / 1000)", app)
         self.assertIn("drawFaceAndHighlightLayer();", app)
         self.assertIn("drawFrontHairCastShadow();", app)
         self.assertIn("updateVoice(timestamp);", app)
         self.assertIn("updateHairPhysics(delta);", app)
-        self.assertNotIn("window.__purupuruPerf", app)
-        self.assertNotIn("PERF_PROFILER_VERSION", app)
-        self.assertNotIn("perfMeasure", app)
-        self.assertNotIn("perfCounter", app)
-        self.assertNotIn("perfStartSection", app)
-        self.assertNotIn("perfEndSection", app)
-        self.assertNotIn("recentSpikes", app)
+        self.assertIn("const PERF_PROFILER_VERSION = 2", app)
+        self.assertIn('const PERF_STORAGE_KEY = "purupuru-pngtuber-perf-v1"', app)
+        self.assertIn("function perfUrlFlagEnabled()", app)
+        self.assertIn("if (perfUrlFlagEnabled()) return true;", app)
+        self.assertIn("window.__purupuruPerf = purupuruPerfApi", app)
+        self.assertIn("window.purupuruPerf = purupuruPerfApi", app)
+        self.assertIn("perfStartSection", app)
+        self.assertIn("perfEndSection", app)
+        self.assertIn("perfRecordGpuMesh", app)
+        self.assertIn("const MAX_JSON_KEYS_PER_OBJECT = 2000", app)
+        self.assertIn("const MAX_JSON_NODE_COUNT = 50000", app)
+        self.assertIn("const MAX_AVATAR_IMAGE_EDGE = 4096", app)
+        self.assertIn("function pngU8Dimensions(u8, name = \"PNG\")", app)
+        self.assertIn("function validateAvatarImageSize(size, key = \"キャラ素材\")", app)
+        self.assertIn("validateAvatarImageSize(pngU8Dimensions(u8, name), name)", app)
+        self.assertIn("function pngDataUrlToObjectUrl(src, name = \"PNGアイテム\", maxLength = Infinity)", app)
+        self.assertIn("URL.revokeObjectURL(url);", app)
+        self.assertIn("itemLayers.length = 0;\n    markItemLayerSlotsDirty();", app)
+        self.assertIn("function invalidateFrontHairShadowComposite()", app)
+        self.assertIn("function invalidateItemLayerShadowComposite()", app)
+        self.assertIn("itemLayerSlotRevision += 1;\n    invalidateItemLayerShadowComposite();", app)
+        self.assertIn("itemHandleVisible = true;\n      markItemLayerSlotsDirty();\n      const optimizeText", app)
+        self.assertIn("if (limit) layer[key] = Math.round(clamp(value, limit.min, limit.max));\n    invalidateItemLayerShadowComposite();", app)
+        self.assertIn("layer.scale = Math.round(clamp(itemDrag.startScale * (distance / itemDrag.startDistance), 10, 500));\n    }\n\n    invalidateItemLayerShadowComposite();\n    updateItemLayerUi({ rebuildList: false });", app)
+        self.assertIn("frontHairShadowCompositeFrame = -1;", app)
+
+        motion_body = self.js_function_body(app, "function runtimeMotionReason(")
+        self.assertLess(motion_body.index('if (setupModeActive()) return "setup";'), motion_body.index('if (obsPublishEnabled) return "obsPublish";'))
+        self.assertLess(motion_body.index('if (micOn) return "voice.mic";'), motion_body.index('if (obsPublishEnabled) return "obsPublish";'))
+        item_ui_body = self.js_function_body(app, "function updateItemLayerUi(")
+        self.assertNotIn("markItemLayerSlotsDirty", item_ui_body)
 
     def test_range_outputs_are_associated_with_inputs(self) -> None:
         html = self.read_text("index.html")
